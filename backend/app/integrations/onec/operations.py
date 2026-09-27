@@ -14,12 +14,14 @@ from onec_odata import F
 
 from app.integrations.onec.adapter import MockAdapter, ODataAdapter, OneCAdapter
 from app.integrations.onec.client import OneCClientWrapper
+from app.integrations.onec.execution import GuardedExecutionPipeline
 from app.integrations.onec.output_filter import OneCOutputFilter
 from app.integrations.onec.policy import (
     OneCPolicyEnforcer,
     RiskLevel,
     requires_risk_level,
 )
+from app.repositories.domain_repos import ToolCallRepository
 from app.services.audit_service import AuditService
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,8 @@ logger = logging.getLogger(__name__)
 class OneCOperationsService:
     """
     Executes standard read-only operations against 1C:Enterprise via OneCAdapter.
-    Ensures policy compliance, immutable audit logging, output redaction, and dry-run execution.
+    Delegates all guard checks, dry-run simulation, execution, output filtering,
+    and telemetry logging to the canonical GuardedExecutionPipeline.
     """
 
     def __init__(
@@ -39,11 +42,13 @@ class OneCOperationsService:
         output_filter: Optional[OneCOutputFilter] = None,
         is_mock: bool = False,
         adapter: Optional[OneCAdapter] = None,
+        tool_repo: Optional[ToolCallRepository] = None,
     ):
         self.policy = policy_enforcer or OneCPolicyEnforcer()
         self.audit = audit_service
         self.filter = output_filter or OneCOutputFilter()
         self.client = client
+        self.tool_repo = tool_repo
 
         # Resolve adapter
         if adapter is not None:
@@ -65,81 +70,28 @@ class OneCOperationsService:
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         """
-        Core generic execution pipeline:
-        1. Security policy check (throws PolicyViolationError if blocked)
-        2. Dry-run branch (validates policy without invoking transport/mock data)
-        3. Execution via OneCAdapter
-        4. Output filtering (IIN/BIN masking & row limits)
-        5. Immutable audit logging
+        Executes operation through the canonical GuardedExecutionPipeline.
+        Preserves legacy audit action names ('ONEC_OPERATION_EXECUTED') for backward compatibility.
         """
-        # 1. Enforce policy
-        self.policy.verify_or_raise(operation_name, risk_level)
-
-        # 2. Dry run check
-        if dry_run:
-            if self.audit:
-                await self.audit.log_event(
-                    action="TOOL_DRY_RUN_REQUESTED",
-                    entity_type="OneCOperation",
-                    entity_id=operation_name,
-                    new_values={
-                        "operation": operation_name,
-                        "risk_level": risk_level.value,
-                        "params": params,
-                        "would_execute": True,
-                        "is_mock": self.is_mock,
-                    },
-                    user_id=user_id,
-                )
-            return {
-                "operation": operation_name,
-                "risk_level": risk_level.value,
-                "data": None,
-                "is_truncated": False,
-                "is_mock": self.is_mock,
-                "dry_run": True,
-            }
-
-        status_result = "SUCCESS"
-        error_msg = None
-        raw_result: Any = None
-
-        try:
-            raw_result = await executor_func()
-        except Exception as exc:
-            status_result = "FAILED"
-            error_msg = str(exc)
-            logger.error(f"1C operation {operation_name} failed: {exc}")
-            raise
-        finally:
-            # 5. Record event in immutable audit log
-            if self.audit:
-                await self.audit.log_event(
-                    action="ONEC_OPERATION_EXECUTED",
-                    entity_type="OneCOperation",
-                    entity_id=operation_name,
-                    new_values={
-                        "operation": operation_name,
-                        "risk_level": risk_level.value,
-                        "params": params,
-                        "status": status_result,
-                        "error": error_msg,
-                        "is_mock": self.is_mock,
-                    },
-                    user_id=user_id,
-                )
-
-        # 4. Filter and sanitize sensitive fields
-        sanitized_data, is_truncated = self.filter.filter_result(raw_result)
-
-        return {
-            "operation": operation_name,
-            "risk_level": risk_level.value,
-            "data": sanitized_data,
-            "is_truncated": is_truncated,
-            "is_mock": self.is_mock,
-            "dry_run": False,
-        }
+        pipeline = GuardedExecutionPipeline(
+            policy_enforcer=self.policy,
+            adapter=self.adapter,
+            audit_service=self.audit,
+            output_filter=self.filter,
+            tool_repo=self.tool_repo,
+        )
+        return await pipeline.execute(
+            operation_name=operation_name,
+            risk_level=risk_level,
+            params=params,
+            executor_func=executor_func,
+            user_id=user_id,
+            dry_run=dry_run,
+            audit_action="ONEC_OPERATION_EXECUTED",
+            audit_entity_type="OneCOperation",
+            source="http_api",
+            close_adapter=True,
+        )
 
     # =========================================================================
     # 1. Healthcheck / System Status (L0: SAFE_READ)

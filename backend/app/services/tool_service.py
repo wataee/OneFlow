@@ -1,15 +1,16 @@
 """
 Generic Tool Execution Pipeline and Discovery Service.
-Enforces Tool -> Policy -> Execution -> Filter -> Audit pipeline.
+Enforces Tool -> Policy -> Execution -> Filter -> Audit pipeline
+via the canonical GuardedExecutionPipeline.
 """
 
-import time
-import uuid
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 from app.core.dependencies import CurrentUserContext
+from app.integrations.onec.execution import GuardedExecutionPipeline
 from app.integrations.onec.output_filter import OneCOutputFilter
 from app.integrations.onec.policy import FORBIDDEN_OPERATIONS, PolicyViolationError
 from app.integrations.onec.tools import ToolDefinition, registry as default_registry
@@ -35,34 +36,36 @@ class ToolValidationError(Exception):
 class ExecutionContext(BaseModel):
     """
     Contextual execution envelope providing tenant isolation, caller identity,
-    dry-run state, and unique request tracing ID.
+    dry-run state, call source tagging (http_api vs mcp), and unique request tracing ID.
     """
     organization_id: str
     user_id: Optional[str] = None
     role: str = "user"
     dry_run: bool = False
+    source: str = "http_api"
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
     @classmethod
-    def from_user_context(cls, user_ctx: CurrentUserContext, dry_run: bool = False) -> "ExecutionContext":
+    def from_user_context(
+        cls,
+        user_ctx: CurrentUserContext,
+        dry_run: bool = False,
+        source: str = "http_api",
+    ) -> "ExecutionContext":
         return cls(
             organization_id=user_ctx.organization_id,
             user_id=user_ctx.user_id,
             role=user_ctx.role,
             dry_run=dry_run,
+            source=source,
         )
 
 
 class ToolExecutionService:
     """
-    Unified execution pipeline:
-    1. Tool discovery and resolution
-    2. Input schema validation (Pydantic)
-    3. Security policy check (OneCPolicyEnforcer)
-    4. Dry-run branch
-    5. Execution via OneCAdapter
-    6. Output sanitization & masking (OneCOutputFilter)
-    7. Dual telemetry recording (AuditLog + ToolCall)
+    Tool discovery and invocation service.
+    Validates input parameters according to ToolRegistry schemas and delegates
+    guarded execution to the canonical GuardedExecutionPipeline.
     """
 
     def __init__(
@@ -93,8 +96,14 @@ class ToolExecutionService:
         params: Dict[str, Any],
         context: ExecutionContext,
     ) -> Dict[str, Any]:
-        start_time = time.perf_counter()
-
+        """
+        Executes a registered tool:
+        1. Checks forbidden operations denylist
+        2. Resolves tool from ToolRegistry
+        3. Validates parameters against typed Pydantic input schema
+        4. Delegates to GuardedExecutionPipeline for policy check, dry-run,
+           protected execution, redaction, telemetry, and safe adapter closure.
+        """
         # 1. Resolve tool by name
         if tool_name in FORBIDDEN_OPERATIONS:
             raise PolicyViolationError(
@@ -123,126 +132,25 @@ class ToolExecutionService:
         policy_enforcer = op_service.policy
         adapter = op_service.adapter
 
-        # 3. Security Policy check
-        try:
-            policy_enforcer.verify_or_raise(tool.name, tool.risk_level)
-        except PolicyViolationError as pve:
-            # Log blocked attempt
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
-            await self.tool_repo.log_call(
-                tool_name=tool.name,
-                risk_level=tool.risk_level.value,
-                params=params,
-                status="BLOCKED",
-                is_dry_run=context.dry_run,
-                latency_ms=latency_ms,
-                error=str(pve),
-                user_id=context.user_id,
-            )
-            await self.audit_service.log_event(
-                action="TOOL_EXECUTION_BLOCKED",
-                entity_type="ToolCall",
-                entity_id=tool.name,
-                new_values={
-                    "tool": tool.name,
-                    "risk_level": tool.risk_level.value,
-                    "reason": str(pve),
-                    "request_id": context.request_id,
-                },
-                user_id=context.user_id,
-            )
-            raise
+        # 3. Delegate to canonical GuardedExecutionPipeline
+        pipeline = GuardedExecutionPipeline(
+            policy_enforcer=policy_enforcer,
+            adapter=adapter,
+            audit_service=self.audit_service,
+            output_filter=self.output_filter,
+            tool_repo=self.tool_repo,
+        )
 
-        # 4. Dry-run branch: return pre-flight validation without invoking 1C or mock transport
-        if context.dry_run:
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
-            await self.tool_repo.log_call(
-                tool_name=tool.name,
-                risk_level=tool.risk_level.value,
-                params=params,
-                status="SUCCESS",
-                is_dry_run=True,
-                latency_ms=latency_ms,
-                user_id=context.user_id,
-            )
-            await self.audit_service.log_event(
-                action="TOOL_DRY_RUN_REQUESTED",
-                entity_type="ToolCall",
-                entity_id=tool.name,
-                new_values={
-                    "tool": tool.name,
-                    "risk_level": tool.risk_level.value,
-                    "params": params,
-                    "would_execute": True,
-                    "request_id": context.request_id,
-                    "is_mock": adapter.is_mock,
-                },
-                user_id=context.user_id,
-            )
-            return {
-                "tool": tool.name,
-                "risk_level": tool.risk_level.value,
-                "data": None,
-                "is_truncated": False,
-                "is_mock": adapter.is_mock,
-                "dry_run": True,
-            }
-
-        # 5. Execution via OneCAdapter
-        raw_result: Any = None
-        status_result = "SUCCESS"
-        error_msg: Optional[str] = None
-
-        try:
-            raw_result = await executor(adapter, validated_input)
-        except Exception as exc:
-            status_result = "FAILED"
-            error_msg = str(exc)
-            logger.error(f"Execution of tool '{tool_name}' failed: {exc}")
-            raise
-        finally:
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
-            if adapter:
-                await adapter.close()
-
-            # Record telemetry in tool_calls
-            await self.tool_repo.log_call(
-                tool_name=tool.name,
-                risk_level=tool.risk_level.value,
-                params=params,
-                status=status_result,
-                is_dry_run=False,
-                latency_ms=latency_ms,
-                error=error_msg,
-                user_id=context.user_id,
-            )
-
-            # Record event in immutable audit log
-            await self.audit_service.log_event(
-                action="TOOL_EXECUTED",
-                entity_type="ToolCall",
-                entity_id=tool.name,
-                new_values={
-                    "tool": tool.name,
-                    "risk_level": tool.risk_level.value,
-                    "params": params,
-                    "status": status_result,
-                    "error": error_msg,
-                    "latency_ms": latency_ms,
-                    "request_id": context.request_id,
-                    "is_mock": adapter.is_mock,
-                },
-                user_id=context.user_id,
-            )
-
-        # 6. Filter and sanitize sensitive fields
-        sanitized_data, is_truncated = self.output_filter.filter_result(raw_result)
-
-        return {
-            "tool": tool.name,
-            "risk_level": tool.risk_level.value,
-            "data": sanitized_data,
-            "is_truncated": is_truncated,
-            "is_mock": adapter.is_mock,
-            "dry_run": False,
-        }
+        return await pipeline.execute(
+            operation_name=tool.name,
+            risk_level=tool.risk_level,
+            params=params,
+            executor_func=lambda: executor(adapter, validated_input),
+            user_id=context.user_id,
+            dry_run=context.dry_run,
+            request_id=context.request_id,
+            audit_action="TOOL_EXECUTED",
+            audit_entity_type="ToolCall",
+            source=context.source,
+            close_adapter=True,
+        )

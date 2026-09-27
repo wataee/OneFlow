@@ -8,6 +8,7 @@ from app.integrations.onec.client import OneCClientWrapper, OneCConfigurationErr
 from app.integrations.onec.operations import OneCOperationsService
 from app.integrations.onec.output_filter import OneCOutputFilter
 from app.integrations.onec.policy import OneCPolicyEnforcer, RiskLevel
+from app.repositories.domain_repos import ToolCallRepository
 from app.services.audit_service import AuditService
 
 
@@ -15,13 +16,14 @@ class OneCService:
     """
     Application service managing 1C operations for a specific organization tenant.
     Loads tenant 1C configuration, decrypts credentials, constructs policy enforcers,
-    and executes guarded operations.
+    and delegates guarded operations to OneCOperationsService and GuardedExecutionPipeline.
     """
 
     def __init__(self, session: AsyncSession, organization_id: str):
         self.session = session
         self.organization_id = organization_id
         self.audit_service = AuditService(session, organization_id)
+        self.tool_repo = ToolCallRepository(session, organization_id)
 
     async def _get_tenant_record(self) -> Tuple[Dict[str, Any], Optional[str]]:
         from app.models.entities import Organization
@@ -65,15 +67,12 @@ class OneCService:
             audit_service=self.audit_service,
             output_filter=OneCOutputFilter(default_max_rows=settings.ONEC_OUTPUT_MAX_ROWS),
             adapter=adapter,
+            tool_repo=self.tool_repo,
         )
 
     async def check_health(self, user_id: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         op_service = await self.get_operations_service()
-        try:
-            return await op_service.health_check(user_id=user_id, dry_run=dry_run)
-        finally:
-            if op_service.adapter:
-                await op_service.adapter.close()
+        return await op_service.health_check(user_id=user_id, dry_run=dry_run)
 
     async def get_unposted_documents(
         self,
@@ -83,13 +82,9 @@ class OneCService:
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         op_service = await self.get_operations_service()
-        try:
-            return await op_service.get_unposted_documents(
-                doc_type=doc_type, limit=limit, user_id=user_id, dry_run=dry_run
-            )
-        finally:
-            if op_service.adapter:
-                await op_service.adapter.close()
+        return await op_service.get_unposted_documents(
+            doc_type=doc_type, limit=limit, user_id=user_id, dry_run=dry_run
+        )
 
     async def get_debtors(
         self,
@@ -99,13 +94,9 @@ class OneCService:
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         op_service = await self.get_operations_service()
-        try:
-            return await op_service.get_debtors(
-                min_debt=min_debt, limit=limit, user_id=user_id, dry_run=dry_run
-            )
-        finally:
-            if op_service.adapter:
-                await op_service.adapter.close()
+        return await op_service.get_debtors(
+            min_debt=min_debt, limit=limit, user_id=user_id, dry_run=dry_run
+        )
 
     async def get_inventory(
         self,
@@ -115,10 +106,6 @@ class OneCService:
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         op_service = await self.get_operations_service()
-        try:
-            return await op_service.get_inventory(
-                warehouse=warehouse, limit=limit, user_id=user_id, dry_run=dry_run
-            )
-        finally:
-            if op_service.adapter:
-                await op_service.adapter.close()
+        return await op_service.get_inventory(
+            warehouse=warehouse, limit=limit, user_id=user_id, dry_run=dry_run
+        )

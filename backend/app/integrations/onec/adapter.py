@@ -79,6 +79,7 @@ class ODataAdapter(OneCAdapter):
 
     def __init__(self, client: OneCClientWrapper):
         self._client = client
+        self._closed = False
 
     @property
     def is_mock(self) -> bool:
@@ -121,7 +122,9 @@ class ODataAdapter(OneCAdapter):
         )
 
     async def close(self) -> None:
-        self._client.close()
+        if not self._closed:
+            self._closed = True
+            self._client.close()
 
 
 class MockAdapter(OneCAdapter):
