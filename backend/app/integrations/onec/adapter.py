@@ -146,16 +146,27 @@ class MockAdapter(OneCAdapter):
         }
 
     async def get_metadata(self) -> Dict[str, Any]:
+        entities = [
+            "Catalog_Контрагенты",
+            "Catalog_Номенклатура",
+            "Catalog_Склады",
+            "Catalog_Валюты",
+            "Document_ПлатежноеПоручениеИсходящее",
+            "Document_РеализацияТоваровУслуг",
+            "Document_ПоступлениеТоваровУслуг",
+            "AccumulationRegister_ТоварыНаСкладах",
+            "AccumulationRegister_ВзаиморасчетыСКонтрагентами",
+        ]
         return {
             "version": "1.0",
             "schema": "StandardODATA",
-            "entities": [
-                "Catalog_Контрагенты",
-                "Document_ПлатежноеПоручениеИсходящее",
-                "AccumulationRegister_ТоварыНаСкладах",
-                "AccumulationRegister_ВзаиморасчетыСКонтрагентами",
-            ],
+            "entities": entities,
+            "catalogs": ["Контрагенты", "Номенклатура", "Склады", "Валюты"],
+            "documents": ["ПлатежноеПоручениеИсходящее", "РеализацияТоваровУслуг", "ПоступлениеТоваровУслуг"],
+            "accumulation_registers": ["ТоварыНаСкладах", "ВзаиморасчетыСКонтрагентами"],
+            "total_entities": len(entities),
         }
+
 
     async def list_catalog(
         self,

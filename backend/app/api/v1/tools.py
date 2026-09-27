@@ -33,11 +33,11 @@ async def list_available_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Returns list of available tools matching the tenant's effective risk ceiling
-    and JSON Schema parameter contracts.
+    Returns list of available tools matching the tenant's effective risk ceiling,
+    caller role permissions, and JSON Schema parameter contracts.
     """
     service = ToolExecutionService(db, current_user.organization_id)
-    tools = await service.list_tools_for_tenant()
+    tools = await service.list_tools_for_tenant(user_role=current_user.role)
     return [
         ToolDefinitionResponse(
             name=t.name,
@@ -46,6 +46,9 @@ async def list_available_tools(
             is_mutating=t.is_mutating,
             output_summary=t.output_summary,
             input_schema=t.get_json_schema(),
+            schema_hash=t.schema_hash,
+            allowed_roles=t.allowed_roles,
+            requires_approval=t.requires_approval,
         )
         for t in tools
     ]
@@ -65,6 +68,7 @@ async def execute_tool(
     Tool -> Policy/Permission -> Execution -> Redaction -> Audit.
     Supports dry-run simulation mode without external side effects.
     Supports idempotency caching, in-flight deduplication, and request correlation.
+    Supports Human-in-the-Loop authorization gates.
     """
     effective_idempotency_key = x_idempotency_key or req.idempotency_key
     effective_request_id = x_request_id or req.request_id
@@ -75,6 +79,7 @@ async def execute_tool(
         dry_run=req.dry_run,
         request_id=effective_request_id,
         idempotency_key=effective_idempotency_key,
+        approval_review_id=req.approval_review_id,
     )
     response.headers["X-Request-ID"] = context.request_id
 

@@ -156,28 +156,34 @@ async def handle_list_tools(
 ) -> Dict[str, Any]:
     """
     Handles MCP 'tools/list' discovery request.
-    Dynamically reflects tools matching current tenant's effective risk ceiling.
+    Dynamically reflects tools matching current tenant's effective risk ceiling
+    and caller role permissions.
     """
     async with AsyncSessionLocal() as db:
         service = ToolExecutionService(
             session=db,
             organization_id=current_user.organization_id,
         )
-        tools = await service.list_tools_for_tenant()
+        tools = await service.list_tools_for_tenant(user_role=current_user.role)
 
     tools_list = []
     for tool_def in tools:
         schema = tool_def.input_schema_class.model_json_schema()
         description = (
             f"{tool_def.description} "
-            f"[risk: {tool_def.risk_level.value}, read-only: {tool_def.read_only}]"
+            f"[risk: {tool_def.risk_level.value}, read-only: {tool_def.read_only}, hash: {tool_def.schema_hash[:8]}]"
         )
         tool_obj = types.Tool(
             name=tool_def.name,
             description=description,
             inputSchema=schema,
         )
-        tools_list.append(tool_obj.model_dump(by_alias=True, exclude_none=True))
+        dumped = tool_obj.model_dump(by_alias=True, exclude_none=True)
+        dumped["schemaHash"] = tool_def.schema_hash
+        dumped["requiresApproval"] = tool_def.requires_approval
+        if tool_def.allowed_roles:
+            dumped["allowedRoles"] = tool_def.allowed_roles
+        tools_list.append(dumped)
 
     return {
         "jsonrpc": "2.0",
@@ -208,6 +214,11 @@ async def handle_call_tool(
         or arguments.get("_idempotency_key")
     )
     request_id = meta.get("request_id") or (str(req_id) if req_id is not None else str(uuid.uuid4()))
+    approval_review_id = (
+        meta.get("approval_review_id")
+        or params.get("approval_review_id")
+        or arguments.get("_approval_review_id")
+    )
 
     if not tool_name:
         err_body = {
@@ -233,6 +244,7 @@ async def handle_call_tool(
         source="mcp",
         request_id=request_id,
         idempotency_key=idempotency_key,
+        approval_review_id=approval_review_id,
     )
 
     async with AsyncSessionLocal() as db:

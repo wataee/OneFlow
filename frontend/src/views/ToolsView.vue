@@ -20,7 +20,7 @@
           <n-gi v-for="tool in tools" :key="tool.name">
             <n-card embedded size="small" :title="tool.name" class="tool-card">
               <template #header-extra>
-                <div style="display: flex; gap: 6px; align-items: center;">
+                <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
                   <n-tag :type="getRiskTagType(tool.risk_level)" size="small">
                     {{ tool.risk_level }}
                   </n-tag>
@@ -30,6 +30,20 @@
                   <n-tag v-else type="default" size="small">
                     Read-Only
                   </n-tag>
+                  <n-tag v-if="tool.requires_approval" type="warning" size="small">
+                    🛡️ HITL Approval
+                  </n-tag>
+                  <n-tag v-if="tool.allowed_roles" type="info" size="small">
+                    Роли: {{ tool.allowed_roles.join(', ') }}
+                  </n-tag>
+                  <n-tooltip v-if="tool.schema_hash" trigger="hover">
+                    <template #trigger>
+                      <n-tag size="small" type="default" style="font-family: monospace; font-size: 11px;">
+                        #{{ tool.schema_hash.substring(0, 8) }}
+                      </n-tag>
+                    </template>
+                    SHA-256 fingerprint целостности: {{ tool.schema_hash }}
+                  </n-tooltip>
                 </div>
               </template>
 
@@ -106,6 +120,25 @@
 
         <div v-if="executionResult" style="margin-top: 16px;">
           <n-alert
+            v-if="executionResult.status === 'REQUIRES_APPROVAL'"
+            type="warning"
+            title="Требуется согласование (Human-in-the-Loop)"
+            style="margin-bottom: 8px;"
+          >
+            <div>
+              <strong>{{ executionResult.message }}</strong>
+            </div>
+            <div style="margin-top: 6px; font-size: 12px;">
+              <span>Review Task ID: <code>{{ executionResult.review_task_id }}</code></span>
+              <span v-if="executionResult.task_id"> | Task ID: <code>{{ executionResult.task_id }}</code></span>
+            </div>
+            <div style="margin-top: 4px; font-size: 11px; opacity: 0.85;">
+              Запрос зарегистрирован и ожидает решения руководителя во вкладке «Согласование».
+            </div>
+          </n-alert>
+
+          <n-alert
+            v-else
             :type="executionResult.error ? 'error' : 'success'"
             :title="executionResult.error ? 'Ошибка выполнения' : 'Результат выполнения'"
             style="margin-bottom: 8px;"
@@ -166,6 +199,7 @@ import {
   NFormItem,
   NInput,
   NAlert,
+  NTooltip,
   useMessage,
 } from 'naive-ui';
 import api from '@/api/client';
@@ -251,7 +285,7 @@ const historyColumns = [
       const type =
         row.status === 'SUCCESS'
           ? 'success'
-          : row.status === 'BLOCKED'
+          : row.status === 'BLOCKED' || row.status === 'PENDING_APPROVAL'
           ? 'warning'
           : 'error';
       return h(NTag, { size: 'small', type }, { default: () => row.status });
@@ -306,7 +340,11 @@ const openRunModal = (tool: any, dryRun: boolean) => {
   executionResult.value = null;
 
   // Prefill default sample params
-  if (tool.name === 'read.documents.get_unposted') {
+  if (tool.name === 'read.system.get_metadata') {
+    paramsJson.value = JSON.stringify({ entity_type: 'all' }, null, 2);
+  } else if (tool.name === 'read.catalog.query') {
+    paramsJson.value = JSON.stringify({ catalog_name: 'Контрагенты', limit: 10, offset: 0 }, null, 2);
+  } else if (tool.name === 'read.documents.get_unposted') {
     paramsJson.value = JSON.stringify({ doc_type: 'ПлатежноеПоручениеИсходящее', limit: 10 }, null, 2);
   } else if (tool.name === 'read.analytics.get_debtors') {
     paramsJson.value = JSON.stringify({ min_debt: 100000, limit: 10 }, null, 2);

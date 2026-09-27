@@ -10,6 +10,9 @@ class ToolDefinitionResponse(BaseModel):
     is_mutating: bool = Field(description="True if operation performs database mutations")
     output_summary: str = Field(description="Description of result structure")
     input_schema: Dict[str, Any] = Field(description="JSON Schema specification for input parameters")
+    schema_hash: str = Field(default="", description="Cryptographic SHA-256 fingerprint for tool poisoning protection")
+    allowed_roles: Optional[List[str]] = Field(default=None, description="Caller roles permitted to execute this tool")
+    requires_approval: bool = Field(default=False, description="Whether this tool requires Human-in-the-Loop authorization")
 
 
 class ToolExecuteRequest(BaseModel):
@@ -18,17 +21,22 @@ class ToolExecuteRequest(BaseModel):
     dry_run: bool = Field(default=False, description="Simulate execution without external side-effects")
     idempotency_key: Optional[str] = Field(default=None, description="Client idempotency key")
     request_id: Optional[str] = Field(default=None, description="Client request correlation ID")
+    approval_review_id: Optional[str] = Field(default=None, description="ID of resolved approval review if tool requires approval")
 
 
 class ToolExecuteResponse(BaseModel):
     tool: str
     risk_level: str
-    data: Any
+    data: Optional[Any] = None
     is_truncated: bool = False
     is_mock: bool = False
     dry_run: bool = False
     request_id: Optional[str] = None
     idempotency_key: Optional[str] = None
+    status: Optional[str] = None
+    review_task_id: Optional[str] = None
+    task_id: Optional[str] = None
+    message: Optional[str] = None
 
 
 class ToolCallHistoryItem(BaseModel):

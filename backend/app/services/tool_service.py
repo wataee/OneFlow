@@ -2,7 +2,12 @@
 Generic Tool Execution Pipeline and Discovery Service.
 Enforces Tool -> Policy -> Execution -> Filter -> Audit pipeline
 via the canonical GuardedExecutionPipeline with idempotency, timeout protection,
-and bounded retries.
+bounded retries, per-tool RBAC authorization, and Human-in-the-Loop approval gates.
+
+Architectural attribution:
+- Per-tool RBAC role policies inspired by PanosSalt/MCP-Gateway (MIT).
+- Human-in-the-Loop (HITL) approval pause gate inspired by openai/openai-agents-python (Apache 2.0).
+- Tool Poisoning Protection fingerprints inspired by Niraven/mcp-gateway (MIT).
 """
 
 import asyncio
@@ -18,8 +23,8 @@ from app.core.dependencies import CurrentUserContext
 from app.integrations.onec.output_filter import OneCOutputFilter
 from app.integrations.onec.policy import FORBIDDEN_OPERATIONS, PolicyViolationError, RiskLevel
 from app.integrations.onec.tools import ToolDefinition, registry as default_registry
-from app.models.entities import ToolCall
-from app.repositories.domain_repos import ToolCallRepository
+from app.models.entities import ReviewDecision, ReviewStatus, ReviewTask, Task, TaskStatus, TaskType, ToolCall
+from app.repositories.domain_repos import ReviewRepository, TaskRepository, ToolCallRepository
 from app.services.audit_service import AuditService
 from app.services.onec_service import OneCService
 
@@ -102,7 +107,8 @@ class ToolInternalError(Exception):
 class ExecutionContext(BaseModel):
     """
     Contextual execution envelope providing tenant isolation, caller identity,
-    dry-run state, call source tagging (http_api vs mcp), and unique request tracing ID.
+    dry-run state, call source tagging (http_api vs mcp), unique request tracing ID,
+    and optional Human-in-the-Loop approval review ID.
     """
     organization_id: str
     user_id: Optional[str] = None
@@ -111,6 +117,7 @@ class ExecutionContext(BaseModel):
     source: str = "http_api"
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     idempotency_key: Optional[str] = None
+    approval_review_id: Optional[str] = None
 
     @classmethod
     def from_user_context(
@@ -120,6 +127,7 @@ class ExecutionContext(BaseModel):
         source: str = "http_api",
         request_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        approval_review_id: Optional[str] = None,
     ) -> "ExecutionContext":
         return cls(
             organization_id=user_ctx.organization_id,
@@ -129,6 +137,7 @@ class ExecutionContext(BaseModel):
             source=source,
             request_id=request_id or str(uuid.uuid4()),
             idempotency_key=idempotency_key,
+            approval_review_id=approval_review_id,
         )
 
 
@@ -139,9 +148,9 @@ class ExecutionContext(BaseModel):
 class ToolExecutionService:
     """
     Tool discovery and invocation service.
-    Validates input parameters according to ToolRegistry schemas and delegates
-    guarded execution to the canonical GuardedExecutionPipeline.
-    Handles idempotency checking, claim tracking, and bounded retries.
+    Validates input parameters according to ToolRegistry schemas, checks role-based
+    access control (RBAC), routes through Human-in-the-Loop gates where required,
+    and delegates execution to the canonical GuardedExecutionPipeline.
     """
 
     def __init__(
@@ -155,21 +164,23 @@ class ToolExecutionService:
         self.registry = tool_registry or default_registry
         self.audit_service = AuditService(session, organization_id)
         self.tool_repo = ToolCallRepository(session, organization_id)
+        self.task_repo = TaskRepository(session, organization_id)
+        self.review_repo = ReviewRepository(session, organization_id)
         self.onec_service = OneCService(session, organization_id)
         self.output_filter = OneCOutputFilter(default_max_rows=settings.ONEC_OUTPUT_MAX_ROWS)
 
-    def list_tools(self) -> List[ToolDefinition]:
-        """Lists all registered tools."""
-        return self.registry.list()
+    def list_tools(self, user_role: Optional[str] = None) -> List[ToolDefinition]:
+        """Lists registered tools optionally filtered by caller role."""
+        return self.registry.list(user_role=user_role)
 
-    async def list_tools_for_tenant(self) -> List[ToolDefinition]:
+    async def list_tools_for_tenant(self, user_role: Optional[str] = None) -> List[ToolDefinition]:
         """
-        Lists registered tools allowed by the tenant's effective risk ceiling.
-        Resolves min(global_ceiling, org_ceiling).
+        Lists registered tools allowed by the tenant's effective risk ceiling
+        and optional caller role. Resolves min(global_ceiling, org_ceiling).
         """
         op_service = await self.onec_service.get_operations_service()
         effective_ceiling = op_service.policy.max_allowed_risk
-        return self.registry.list(max_risk_level=effective_ceiling)
+        return self.registry.list(max_risk_level=effective_ceiling, user_role=user_role)
 
     def get_tool(self, name: str) -> Optional[ToolDefinition]:
         """Gets a tool definition by name."""
@@ -184,8 +195,10 @@ class ToolExecutionService:
         """
         Executes a registered tool:
         1. Checks idempotency (claims in-flight or returns stored SUCCESS result)
-        2. Resolves tool and validates parameters against typed Pydantic schema
-        3. Executes with GuardedExecutionPipeline and bounded retries on retryable errors.
+        2. Resolves tool, checks per-tool RBAC role permissions
+        3. Validates parameters against typed Pydantic schema
+        4. Evaluates Human-in-the-Loop approval gate (creates ReviewTask if approval needed)
+        5. Executes with GuardedExecutionPipeline and bounded retries on retryable errors.
         """
         # 1. Idempotency Check & In-flight claim
         claim_record: Optional[ToolCall] = None
@@ -251,7 +264,20 @@ class ToolExecutionService:
                 await self.session.flush()
             raise ToolNotFoundError(f"No executable handler registered for tool '{tool_name}'.")
 
-        # 3. Input validation according to tool's typed Pydantic schema
+        # 3. Per-Tool RBAC: Role-based authorization check
+        if tool.allowed_roles is not None and context.role not in tool.allowed_roles:
+            role_err = (
+                f"User role '{context.role}' is not authorized to execute tool '{tool_name}'. "
+                f"Permitted roles: {tool.allowed_roles}."
+            )
+            if claim_record:
+                claim_record.status = "BLOCKED"
+                claim_record.error = role_err
+                claim_record.error_code = ToolErrorCode.POLICY_VIOLATION.value
+                await self.session.flush()
+            raise PolicyViolationError(role_err)
+
+        # 4. Input validation according to tool's typed Pydantic schema
         try:
             validated_input = tool.input_schema_class.model_validate(params or {})
         except ValidationError as val_err:
@@ -265,7 +291,105 @@ class ToolExecutionService:
                 errors=val_err.errors(),
             )
 
-        # 4. Guarded execution with bounded retries on retryable errors
+        # 5. Human-in-the-Loop (HITL) Approval Gate
+        if tool.requires_approval and not context.dry_run:
+            approval_valid = False
+            if context.approval_review_id:
+                review = await self.review_repo.get_by_id(context.approval_review_id)
+                if (
+                    review
+                    and review.organization_id == self.organization_id
+                    and review.status == ReviewStatus.RESOLVED
+                    and review.user_decision == ReviewDecision.APPROVE
+                ):
+                    approval_valid = True
+                else:
+                    unapproved_err = (
+                        f"Approval review '{context.approval_review_id}' is not in an approved state."
+                    )
+                    if claim_record:
+                        claim_record.status = "BLOCKED"
+                        claim_record.error = unapproved_err
+                        claim_record.error_code = ToolErrorCode.POLICY_VIOLATION.value
+                        await self.session.flush()
+                    raise PolicyViolationError(unapproved_err)
+
+            if not approval_valid:
+                task = Task(
+                    organization_id=self.organization_id,
+                    type=TaskType.TOOL_APPROVAL,
+                    status=TaskStatus.REVIEW,
+                    input_data={
+                        "tool_name": tool_name,
+                        "params": params,
+                        "source": context.source,
+                        "request_id": context.request_id,
+                    },
+                )
+                await self.task_repo.create(task)
+
+                review = ReviewTask(
+                    organization_id=self.organization_id,
+                    task_id=task.id,
+                    status=ReviewStatus.PENDING,
+                    ai_result={"tool_name": tool_name, "params": params, "request_id": context.request_id},
+                    proposed_changes={
+                        "action": "EXECUTE_TOOL",
+                        "tool_name": tool_name,
+                        "risk_level": tool.risk_level.value,
+                    },
+                )
+                await self.review_repo.create(review)
+
+                approval_payload = {
+                    "tool": tool_name,
+                    "risk_level": tool.risk_level.value,
+                    "status": "REQUIRES_APPROVAL",
+                    "review_task_id": review.id,
+                    "task_id": task.id,
+                    "message": f"Execution of tool '{tool_name}' requires human approval before proceeding.",
+                    "dry_run": False,
+                    "request_id": context.request_id,
+                    "idempotency_key": context.idempotency_key,
+                }
+
+                if claim_record:
+                    claim_record.status = "PENDING_APPROVAL"
+                    claim_record.risk_level = tool.risk_level.value
+                    claim_record.result_payload = approval_payload
+                    await self.session.flush()
+                else:
+                    await self.tool_repo.log_call(
+                        tool_name=tool_name,
+                        risk_level=tool.risk_level.value,
+                        params={**params, "_source": context.source},
+                        status="PENDING_APPROVAL",
+                        is_dry_run=False,
+                        user_id=context.user_id,
+                        request_id=context.request_id,
+                        idempotency_key=context.idempotency_key,
+                        result_payload=approval_payload,
+                    )
+
+                await self.audit_service.log_event(
+                    action="TOOL_APPROVAL_REQUESTED",
+                    entity_type="ReviewTask",
+                    entity_id=review.id,
+                    new_values={
+                        "tool_name": tool_name,
+                        "risk_level": tool.risk_level.value,
+                        "task_id": task.id,
+                        "review_task_id": review.id,
+                        "params": params,
+                        "request_id": context.request_id,
+                        "source": context.source,
+                    },
+                    user_id=context.user_id,
+                )
+
+                return approval_payload
+
+        # 6. Guarded execution with bounded retries on retryable errors
         from app.integrations.onec.execution import GuardedExecutionPipeline
 
         max_retries = settings.ONEC_TOOL_RETRIES

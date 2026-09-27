@@ -229,7 +229,13 @@ class GuardedExecutionPipeline:
         except (ConnectionError, OSError, httpx.HTTPError) as exc:
             status_result = "FAILED"
             error_code = ToolErrorCode.ADAPTER_ERROR.value
+            from app.integrations.onec.error_parser import parse_onec_error_response
+            detail = ""
+            if hasattr(exc, "response") and getattr(exc, "response", None) is not None:
+                detail = parse_onec_error_response(getattr(exc.response, "text", ""))
             error_msg = f"Communication with 1C OData service failed for '{operation_name}'"
+            if detail and detail != error_msg:
+                error_msg = f"{error_msg}: {detail}"
             logger.exception(f"Adapter connection failure for '{operation_name}' (request_id={request_id}): {exc}")
             raised_exc = ToolAdapterError(error_msg)
         except Exception as exc:
