@@ -94,3 +94,5 @@ apiClient.interceptors.response.use(
     return Promise.reject(new Error(detailMsg));
   }
 );
+
+export default apiClient;

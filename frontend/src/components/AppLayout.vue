@@ -112,6 +112,11 @@ const menuOptions = [
     icon: () => h('span', '📁'),
   },
   {
+    label: 'Инструменты 1С',
+    key: 'tools',
+    icon: () => h('span', '🛠️'),
+  },
+  {
     label: 'Настройки',
     key: 'settings',
     icon: () => h('span', '⚙️'),

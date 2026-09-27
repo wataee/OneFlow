@@ -314,95 +314,158 @@ cd backend
 
 ---
 
-## 8. Интеграция с 1С:Предприятие (1C OData Layer)
+## 8. Интеграция с 1С:Предприятие (1C OData, Tool Registry & Adapter Interface)
 
-Интеграция выполнена как изолированный модуль `app/integrations/onec/`, не нарушающий архитектурные границы ядра.
+Интеграция выполнена как модульный слой `app/integrations/onec/`, реализующий паттерн:
+```
+Client / LLM / UI
+       │
+       ▼
+[ Tool Registry & Discovery ]  (GET /api/v1/tools, Pydantic JSON Schemas)
+       │
+       ▼
+[ ToolExecutionService Pipeline ]
+   ├── 1. Tool Resolution & Pydantic Input Validation (422)
+   ├── 2. Security Policy & Risk Ceiling Check (403)
+   ├── 3. Dry-Run Simulation Branch (Без внешних вызовов)
+   ├── 4. OneCAdapter Invocation (ODataAdapter / MockAdapter)
+   ├── 5. Output Sanitization & Redaction (БИН/ИИН/IBAN маскирование)
+   └── 6. Immutable AuditLog & ToolCall Telemetry
+       │
+       ▼
+[ OneCAdapter Interface ]
+   ├── ODataAdapter (HTTPX asyncio.to_thread -> onec-odata OData v3)
+   └── MockAdapter (Детерминированная эмуляция для тестов и Demo-режима)
+```
+
+### Архитектурные особенности:
+
+1. **Единый OneCAdapter интерфейс**:
+   * Бизнес-операции и инструменты не содержат веток `if is_mock`. 
+   * `ODataAdapter` и `MockAdapter` реализуют единый абстрактный контракт `OneCAdapter`. При отсутствии URL в конфигурации мок-режим включается прозрачно на уровне адаптера.
+2. **Типизированный Tool Registry**:
+   * Каждый инструмент имеет статически валидируемую Pydantic-схему параметров (`input_schema_class`), описание, риск-уровень и краткое резюме структуры вывода (`output_summary`).
+   * Безусловно запрещенные операции (`raw_odata_query`, direct SQL, etc.) отвергаются **при регистрации в реестре** (`ToolRegistry.register`), исключая их появление в рантайме.
+3. **Безопасность учетных записей (Credentials Encryption)**:
+   * Пароли подключений к 1С в таблице `organizations.onec_config` сохраняются исключительно в зашифрованном виде с использованием симметричного шифрования Fernet (`ONEC_CREDENTIALS_ENCRYPTION_KEY`).
+   * Пароли никогда не отдаются в GET API и не логируются в открытом виде в `audit_logs` или `tool_calls`.
+4. **Защита от SSRF (Server-Side Request Forgery)**:
+   * Эндпоинты настройки подключения к 1С (`PUT /onec-connection`) строго проверяют адрес сервера: запрещены loopback (`localhost`, `127.0.0.1`), приватные диапазоны RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), Docker-сервисы (`postgres`, `redis`, `backend`) и облачные метаданные.
+5. **Тенант-уровневые потолки риска**:
+   * Организация может задать собственное ограничение `max_onec_risk_level`. Принцип: организация может быть **строже** глобального лимита (`ONEC_MAX_RISK_LEVEL`), но никогда не может быть мягче его (`min(global_ceiling, org_ceiling)`).
+6. **Ролевое разграничение (RBAC)**:
+   * Чтение статуса подключения и запуск инструментов доступны всем авторизованным пользователям организации.
+   * Изменение параметров подключения к 1С и проверка неподтвержденных кредов требуют роли `ADMIN` (`require_admin`).
 
 ### Как подключить 1С для локальной разработки:
 
 1. **Вариант 1 (Облачный 1C:Fresh триал)**:
    * Зарегистрируйте бесплатный 30-дневный демо-доступ на [1cfresh.kz](https://1cfresh.kz) или [1cfresh.com](https://1cfresh.com).
    * В личном кабинете скопируйте URL опубликованного приложения (например, `https://1cfresh.kz/a/buhkz/odata/standard.odata`).
-   * В `.env` или настройках организации укажите:
-     ```env
-     ONEC_ODATA_URL=https://1cfresh.kz/a/buhkz/
-     ONEC_USERNAME=your_fresh_user
-     ONEC_PASSWORD=your_fresh_password
-     ```
+   * В настройках организации (экран «Настройки» в веб-интерфейсе OneFlow) укажите URL, логин и пароль.
 2. **Вариант 2 (Локальная база с веб-публикацией OData)**:
-   * В 1С:Предприятие (версия платформы 8.3.14+) откройте конфигуратор базы («Бухгалтерия для Казахстана» или демо-база).
-   * Выберите меню: **Администрирование → Публикация на веб-сервере...**.
-   * Укажите имя публикации (например, `accounting`) и обязательно отметьте галочкой пункт **«Публиковать стандартный интерфейс OData»**.
-   * Нажмите «Опубликовать» (требуется локальный IIS или Apache).
-   * Адрес OData будет доступен по шаблону: `http://localhost/accounting/odata/standard.odata/`.
+   * В 1С:Предприятие (версия 8.3.14+) откройте конфигуратор базы («Бухгалтерия для Казахстана»).
+   * Выберите: **Администрирование → Публикация на веб-сервере...**.
+   * Укажите имя публикации (`accounting`) и отметьте **«Публиковать стандартный интерфейс OData»**.
+   * Нажмите «Опубликовать».
 3. **Вариант 3 (Режим Demo/Mock без установленной 1С)**:
-   * Если URL 1С не задан, адаптер автоматически работает в **детерминированном mock-режиме**, возвращая реалистичные казахстанские данные (с реальными форматами БИН/ИИН, суммами в тенге KZT и счетами IBAN), что позволяет тестировать все сценарии без внешнего сервера 1С.
+   * Если URL 1С не настроен, OneFlow автоматически использует `MockAdapter`, возвращающий детерминированные казахстанские учетные данные (БИН/ИИН, суммы KZT, IBAN) для бесперебойного локального тестирования.
 
-### Безопасность и модель уровней риска (Risk Levels):
+### Модель уровней риска (Risk Levels):
 
-Операции строго типизированы по шкале уровней риска:
-* **L0 (`SAFE_READ`)**: Диагностика, системные метаданные, нечувствительные справочники (`read.system.health_check`, `read.documents.get_unposted`).
-* **L1 (`ANALYTICS_READ`)**: Сводные отчеты, остатки по складам, анализ задолженности (`read.analytics.get_debtors`, `read.warehouse.get_inventory`).
-* **L2 (`SENSITIVE_READ`)**: Персональные данные, зарплатные ведомости, конфиденциальные контракты.
-* **L3 (`WRITE_DRAFT`)** / **L4 (`WRITE_POST`)** / **L5 (`DESTRUCTIVE`)**: Любые модифицирующие операции.
+* **L0 (`SAFE_READ`)**: Метаданные, проверка связи, нечувствительные справочники (`read.system.health_check`, `read.documents.get_unposted`).
+* **L1 (`ANALYTICS_READ`)**: Сводные отчеты, остатки по складам, задолженность (`read.analytics.get_debtors`, `read.warehouse.get_inventory`).
+* **L2 (`SENSITIVE_READ`)**: Персональные данные, зарплатные ведомости, банковские счета.
+* **L3 (`WRITE_DRAFT`)** / **L4 (`WRITE_POST`)** / **L5 (`DESTRUCTIVE`)**: Модифицирующие операции.
 
 > [!IMPORTANT]
 > **Двойной предохранитель записи (Dual-Safety Latch)**:
-> Запись в 1С **заблокирована по умолчанию** глобальным флагом `ONEC_READ_ONLY_MODE=true` в соответствии с текущим ограничением проекта (killer-фича не выбрана). Любая попытка записи отклоняется до сетевого вызова.
-> Кроме того, деструктивные операции (`raw_odata_query`, прямой SQL, исполнение произвольного кода) находятся в жестком запрещенном списке (`FORBIDDEN_OPERATIONS`) и блокируются безусловно.
-
-### Фильтрация вывода (Output Filter):
-
-Перед тем как данные из 1С передаются в AI-контекст или ответ API:
-1. Автоматически маскируются казахстанские идентификаторы:
-   * **БИН / ИИН** (12 цифр): `981240001122` → `9812******22`.
-   * **IBAN счета** (20 символов): `KZ120000000000123456` → `KZ12************3456`.
-   * **Банковские карты**: `4400-****-****-1234`.
-2. Включается ограничение `max_rows` (по умолчанию 100 строк), исключающее переполнение контекстного окна языковых моделей.
+> Запись в 1С **заблокирована по умолчанию** глобальным флагом `ONEC_READ_ONLY_MODE=true`. Любая модифицирующая операция отклоняется до сетевого вызова.
 
 ---
 
-## 9. Пошагово: Как добавить новую read-only операцию в 1С
+## 9. Tool Execution & Discovery API
 
-1. Откройте `backend/app/integrations/onec/operations.py`.
-2. Создайте метод в классе `OneCOperationsService` с декоратором `@requires_risk_level`:
+### 1. Discovery инструментов:
+* `GET /api/v1/tools`
+* Возвращает список всех зарегистрированных инструментов с их метаданными, уровнем риска и Pydantic JSON Schema параметров.
+
+### 2. Запуск инструмента:
+* `POST /api/v1/tools/execute`
+* Тело запроса:
+  ```json
+  {
+    "tool_name": "read.analytics.get_debtors",
+    "params": {
+      "min_debt": 500000.0,
+      "limit": 20
+    },
+    "dry_run": false
+  }
+  ```
+* Если `"dry_run": true`, система валидирует схему и проверяет политики доступа, но **не обращается к 1С/адаптеру** и возвращает:
+  ```json
+  {
+    "tool": "read.analytics.get_debtors",
+    "risk_level": "ANALYTICS_READ",
+    "data": null,
+    "is_truncated": false,
+    "is_mock": false,
+    "dry_run": true
+  }
+  ```
+
+### 3. История вызовов и телеметрия:
+* `GET /api/v1/tools/history?limit=50`
+* Возвращает журнал вызовов текущей организации (статус, latency_ms, параметры, флаг dry_run, ошибки).
+
+### 4. Управление подключением 1С:
+* `GET /api/v1/onec-connection` — просмотр статуса подключения (без пароля).
+* `PUT /api/v1/onec-connection` (Admin) — сохранение параметров с Fernet-шифрованием и SSRF-валидацией.
+* `POST /api/v1/onec-connection/test-connection` (Admin) — тестовая проверка связи перед сохранением.
+
+---
+
+## 10. Пошагово: Как добавить новый инструмент в Tool Registry
+
+1. Откройте `backend/app/integrations/onec/tools.py`.
+2. Создайте строго типизированную Pydantic-схему входных параметров:
    ```python
-   @requires_risk_level(RiskLevel.ANALYTICS_READ)
-   async def get_turnover_balance(
-       self, account_code: str = "3310", limit: int = 50, user_id: Optional[str] = None
-   ) -> Dict[str, Any]:
-       """
-       Taxonomy: read.analytics.get_turnover_balance
-       Получение оборотно-сальдовой ведомости по счету (например, 3310 - расчеты с поставщиками).
-       """
-       operation_name = "read.analytics.get_turnover_balance"
-
-       async def _exec():
-           if self.is_mock or not self.client:
-               return [{"account": account_code, "debit_turnover": 450000, "credit_turnover": 380000}]
-
-           # В реальной 1С: выборка через onec-odata
-           filter_expr = F("Счет") == account_code
-           return await self.client.list_accumulation_register(
-               "Хозрасчетный_Обороты", top=limit, filter_expr=filter_expr
-           )
-
-       return await self._execute_with_guards(
-           operation_name=operation_name,
-           risk_level=RiskLevel.ANALYTICS_READ,
-           params={"account_code": account_code, "limit": limit},
-           executor_func=_exec,
-           user_id=user_id,
+   class TurnoverBalanceInput(BaseModel):
+       account_code: str = Field(default="3310", description="Номер бухгалтерского счета")
+       limit: int = Field(default=50, ge=1, le=100, description="Максимум строк")
+   ```
+3. Реализуйте функцию-исполнитель (принимающую `adapter: OneCAdapter` и валидированные параметры):
+   ```python
+   async def _exec_turnover_balance(adapter: OneCAdapter, params: TurnoverBalanceInput) -> Any:
+       return await adapter.list_accumulation_register(
+           "Хозрасчетный_Обороты", top=params.limit
        )
    ```
-3. Метод автоматически получит:
-   * Предварительную проверку политики доступа и лимита риска.
-   * Запись события в неизменяемый журнал `audit_logs`.
-   * Автоматическое маскирование БИН/ИИН и ограничение количества строк перед передачей в AI-модель!
+4. Зарегистрируйте инструмент в глобальном реестре:
+   ```python
+   registry.register(
+       ToolDefinition(
+           name="read.analytics.get_turnover_balance",
+           description="Анализ оборотно-сальдовой ведомости по счету учета.",
+           risk_level=RiskLevel.ANALYTICS_READ,
+           input_schema_class=TurnoverBalanceInput,
+           output_summary="Список оборотов по счету с суммами дебета и кредита.",
+       ),
+       _exec_turnover_balance,
+   )
+   ```
+5. Новый инструмент автоматически:
+   * Появится в `GET /api/v1/tools` с готовой JSON-схемой для LLM и UI.
+   * Будет доступен для вызова через `POST /api/v1/tools/execute`.
+   * Получит поддержку режима `dry_run=true`.
+   * Будет проверен на лимит риска организации и глобальный предохранитель.
+   * Пройдет через автоматическое маскирование БИН/ИИН/IBAN.
+   * Зафиксирует факт исполнения в `audit_logs` и таблице `tool_calls`.
 
 ---
 
-## 10. Источники и лицензии сторонних материалов
+## 11. Источники и лицензии сторонних материалов
 
 * **onec-odata** (Python, MIT License, автор: Eugene Finskiy)
   * Репозиторий: [https://github.com/efinskiy/onec-odata](https://github.com/efinskiy/onec-odata)

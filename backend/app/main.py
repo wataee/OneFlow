@@ -9,8 +9,10 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.files import router as files_router
 from app.api.v1.onec import router as onec_router
+from app.api.v1.onec_connection import router as onec_connection_router
 from app.api.v1.review import router as review_router
 from app.api.v1.tasks import router as tasks_router
+from app.api.v1.tools import router as tools_router
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, Base, engine
 
@@ -123,6 +125,8 @@ api_v1 = FastAPI(title="SaaS Foundation API v1")
 api_v1.include_router(auth_router)
 api_v1.include_router(tasks_router)
 api_v1.include_router(onec_router)
+api_v1.include_router(onec_connection_router)
+api_v1.include_router(tools_router)
 api_v1.include_router(review_router)
 api_v1.include_router(files_router)
 api_v1.include_router(dashboard_router)

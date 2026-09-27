@@ -68,6 +68,8 @@ class Organization(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # Per-tenant 1C OData configuration (base_url, credentials, is_writable, etc.)
     onec_config: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONType, nullable=True)
+    # Organization-level maximum allowed risk ceiling (overrides global if stricter)
+    max_onec_risk_level: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -235,3 +237,36 @@ class FileMetadata(Base):
     )
 
     task: Mapped[Optional["Task"]] = relationship("Task", back_populates="files")
+
+
+class ToolCall(Base):
+    __tablename__ = "tool_calls"
+
+    id: Mapped[str] = mapped_column(
+        UUIDType, primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    organization_id: Mapped[str] = mapped_column(
+        UUIDType, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[Optional[str]] = mapped_column(
+        UUIDType, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    risk_level: Mapped[str] = mapped_column(String(50), nullable=False)
+    is_dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    params: Mapped[Dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False)  # SUCCESS, FAILED, BLOCKED
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    user: Mapped[Optional["User"]] = relationship("User")
+
+    __table_args__ = (
+        Index("ix_tool_calls_org_tool", "organization_id", "tool_name"),
+        Index("ix_tool_calls_org_created", "organization_id", "created_at"),
+    )
+

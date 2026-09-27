@@ -11,6 +11,7 @@ from app.models.entities import (
     ReviewTask,
     Task,
     TaskStatus,
+    ToolCall,
     User,
 )
 from app.repositories.base import BaseRepository, MultiTenantViolationError
@@ -231,3 +232,54 @@ class AuthGlobalRepository:
         await self.session.flush()
         await self.session.refresh(user)
         return user
+
+
+class ToolCallRepository(BaseRepository[ToolCall]):
+    """
+    Tenant-scoped repository for tool execution logs and history.
+    """
+    model_cls = ToolCall
+
+    async def log_call(
+        self,
+        tool_name: str,
+        risk_level: str,
+        params: Dict[str, Any],
+        status: str,
+        is_dry_run: bool = False,
+        latency_ms: Optional[int] = None,
+        error: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> ToolCall:
+        record = ToolCall(
+            organization_id=self.organization_id,
+            user_id=user_id,
+            tool_name=tool_name,
+            risk_level=risk_level,
+            is_dry_run=is_dry_run,
+            params=params,
+            status=status,
+            error=error,
+            latency_ms=latency_ms,
+        )
+        return await self.create(record)
+
+    async def list_recent_calls(
+        self,
+        limit: int = 50,
+        tool_name: Optional[str] = None,
+        is_dry_run: Optional[bool] = None,
+    ) -> List[ToolCall]:
+        stmt = (
+            select(ToolCall)
+            .where(ToolCall.organization_id == self.organization_id)
+            .order_by(ToolCall.created_at.desc())
+            .limit(limit)
+        )
+        if tool_name:
+            stmt = stmt.where(ToolCall.tool_name == tool_name)
+        if is_dry_run is not None:
+            stmt = stmt.where(ToolCall.is_dry_run == is_dry_run)
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+

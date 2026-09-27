@@ -73,10 +73,20 @@ class OneCPolicyEnforcer:
         global_read_only: bool = settings.ONEC_READ_ONLY_MODE,
         max_allowed_risk: RiskLevel = RiskLevel.ANALYTICS_READ,
         is_tenant_writable: bool = False,
+        org_max_risk_level: Optional[RiskLevel] = None,
     ):
         self.global_read_only = global_read_only
-        self.max_allowed_risk = max_allowed_risk
         self.is_tenant_writable = is_tenant_writable
+
+        # Effective risk ceiling: min(global_ceiling, org_ceiling)
+        # Stricter ceiling has lower rank (SAFE_READ=0 < ANALYTICS_READ=1)
+        if org_max_risk_level is not None:
+            if RISK_RANK[org_max_risk_level] < RISK_RANK[max_allowed_risk]:
+                self.max_allowed_risk = org_max_risk_level
+            else:
+                self.max_allowed_risk = max_allowed_risk
+        else:
+            self.max_allowed_risk = max_allowed_risk
 
     def evaluate(self, operation_name: str, risk_level: RiskLevel) -> PolicyDecision:
         # 1. Check unconditionally forbidden operations
