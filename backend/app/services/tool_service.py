@@ -30,6 +30,7 @@ class ToolValidationError(Exception):
     """Raised when input parameters fail Pydantic schema validation."""
     def __init__(self, message: str, errors: Optional[List[Dict[str, Any]]] = None):
         super().__init__(message)
+        self.message = message
         self.errors = errors or []
 
 

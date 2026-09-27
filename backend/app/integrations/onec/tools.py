@@ -81,6 +81,10 @@ class ToolDefinition(BaseModel):
     def is_mutating(self) -> bool:
         return RISK_RANK[self.risk_level] >= RISK_RANK[RiskLevel.WRITE_DRAFT]
 
+    @property
+    def read_only(self) -> bool:
+        return not self.is_mutating
+
     def get_json_schema(self) -> Dict[str, Any]:
         return self.input_schema_class.model_json_schema()
 
@@ -117,8 +121,8 @@ class ToolRegistry:
         return tools
 
 
-# Global default tool registry
 registry = ToolRegistry()
+tool_registry = registry
 
 
 # =============================================================================

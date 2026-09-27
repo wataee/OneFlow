@@ -465,7 +465,106 @@ Client / LLM / UI
 
 ---
 
-## 11. Источники и лицензии сторонних материалов
+## 11. Подключение внешних агентов через MCP (Model Context Protocol)
+
+OneFlow предоставляет стандартизированный MCP-интерфейс к Tool Registry платформы, позволяющий внешним AI-агентам (Claude Desktop, Cursor IDE, LangChain, AutoGen, CrewAI) безопасно взаимодействовать с 1С через OneFlow как единый шлюз безопасности, изоляции тенантов и аудита.
+
+### Архитектурные гарантии шлюза MCP:
+* **Multi-Tenancy**: Вызовы жестко привязаны к `organization_id` из JWT-токена агента. Доступ к чужим базам 1С технически невозможен.
+* **Канонический пайплайн защиты (`GuardedExecutionPipeline`)**: Все MCP-вызовы проходят проверку `FORBIDDEN_OPERATIONS`, проверку лимита риска организации (`max_onec_risk_level`), глобальный режим Read-Only (`ONEC_READ_ONLY_MODE=true`) и автоматическое маскирование БИН/ИИН/IBAN.
+* **Сквозная телеметрия**: Все вызовы через MCP помечаются `source="mcp"` и сохраняются в `tool_calls` и неизменяемом журнале `audit_logs` с миллисекундным зазором задержки.
+
+---
+
+### Инструкция по получению токена доступа
+
+1. Выполните вход через API авторизации для получения JWT Access Token:
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"email": "admin@yourcompany.kz", "password": "YourPassword123"}'
+   ```
+2. Скопируйте поле `access_token` из JSON-ответа.
+
+---
+
+### Конфигурация для Claude Desktop (`claude_desktop_config.json`)
+
+Файл конфигурации расположен по пути:
+* **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+* **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+#### Вариант А: Прямое подключение по SSE (рекомендуется)
+```json
+{
+  "mcpServers": {
+    "oneflow": {
+      "url": "http://localhost:8000/mcp/sse?token=ВАШ_JWT_ACCESS_TOKEN"
+    }
+  }
+}
+```
+
+#### Вариант Б: Через stdio-мост `mcp-proxy` (npx)
+```json
+{
+  "mcpServers": {
+    "oneflow": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sse",
+        "http://localhost:8000/mcp/sse?token=ВАШ_JWT_ACCESS_TOKEN"
+      ]
+    }
+  }
+}
+```
+
+---
+
+### Конфигурация для Cursor IDE (`.cursor/mcp.json`)
+
+В корне вашего проекта создайте или отредактируйте файл `.cursor/mcp.json`:
+
+#### Вариант А: SSE транспорт
+```json
+{
+  "mcpServers": {
+    "oneflow-sse": {
+      "url": "http://localhost:8000/mcp/sse?token=ВАШ_JWT_ACCESS_TOKEN",
+      "transport": "sse"
+    }
+  }
+}
+```
+
+#### Вариант Б: Streamable HTTP (JSON-RPC) транспорт
+```json
+{
+  "mcpServers": {
+    "oneflow-http": {
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ВАШ_JWT_ACCESS_TOKEN"
+      }
+    }
+  }
+}
+```
+
+---
+
+### Доступные эндпоинты MCP шлюза
+
+* `GET /mcp` — метаданные сервера, статус и список поддерживаемых протоколов.
+* `POST /mcp` — Streamable HTTP транспорт (JSON-RPC 2.0). Принимает методы `initialize`, `tools/list`, `tools/call`.
+* `GET /mcp/sse` — Server-Sent Events транспорт для потокового получения сообщений от сервера.
+* `POST /mcp/messages?session_id=...` — прием сообщений от клиентов, подключенных по SSE.
+
+---
+
+## 12. Источники и лицензии сторонних материалов
 
 * **onec-odata** (Python, MIT License, автор: Eugene Finskiy)
   * Репозиторий: [https://github.com/efinskiy/onec-odata](https://github.com/efinskiy/onec-odata)

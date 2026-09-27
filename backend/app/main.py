@@ -13,6 +13,7 @@ from app.api.v1.onec_connection import router as onec_connection_router
 from app.api.v1.review import router as review_router
 from app.api.v1.tasks import router as tasks_router
 from app.api.v1.tools import router as tools_router
+from app.integrations.onec.mcp_server import mcp_router
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, Base, engine
 
@@ -133,3 +134,4 @@ api_v1.include_router(dashboard_router)
 api_v1.include_router(audit_router)
 
 app.mount(settings.API_V1_PREFIX, api_v1)
+app.include_router(mcp_router, prefix="/mcp")
