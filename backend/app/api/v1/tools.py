@@ -1,5 +1,6 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -14,8 +15,12 @@ from app.schemas.tools import (
 )
 from app.services.tool_service import (
     ExecutionContext,
+    InFlightRequestError,
+    ToolAdapterError,
+    ToolErrorCode,
     ToolExecutionService,
     ToolNotFoundError,
+    ToolTimeoutError,
     ToolValidationError,
 )
 
@@ -28,11 +33,11 @@ async def list_available_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Returns list of all available tools in the registry with their risk classification
+    Returns list of available tools matching the tenant's effective risk ceiling
     and JSON Schema parameter contracts.
     """
     service = ToolExecutionService(db, current_user.organization_id)
-    tools = service.list_tools()
+    tools = await service.list_tools_for_tenant()
     return [
         ToolDefinitionResponse(
             name=t.name,
@@ -49,6 +54,9 @@ async def list_available_tools(
 @router.post("/execute", response_model=ToolExecuteResponse)
 async def execute_tool(
     req: ToolExecuteRequest,
+    response: Response,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
     current_user: CurrentUserContext = Depends(get_current_user_context),
     db: AsyncSession = Depends(get_db),
 ):
@@ -56,9 +64,19 @@ async def execute_tool(
     Executes a registered tool through the unified execution pipeline:
     Tool -> Policy/Permission -> Execution -> Redaction -> Audit.
     Supports dry-run simulation mode without external side effects.
+    Supports idempotency caching, in-flight deduplication, and request correlation.
     """
+    effective_idempotency_key = x_idempotency_key or req.idempotency_key
+    effective_request_id = x_request_id or req.request_id
+
     service = ToolExecutionService(db, current_user.organization_id)
-    context = ExecutionContext.from_user_context(current_user, dry_run=req.dry_run)
+    context = ExecutionContext.from_user_context(
+        current_user,
+        dry_run=req.dry_run,
+        request_id=effective_request_id,
+        idempotency_key=effective_idempotency_key,
+    )
+    response.headers["X-Request-ID"] = context.request_id
 
     try:
         result = await service.execute_tool(
@@ -66,20 +84,99 @@ async def execute_tool(
             params=req.params,
             context=context,
         )
+        await db.commit()
         return ToolExecuteResponse(**result)
     except ToolNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        await db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "detail": e.message,
+                "error_code": ToolErrorCode.TOOL_NOT_FOUND.value,
+                "message": e.message,
+                "request_id": context.request_id,
+                "retryable": False,
+            },
+            headers={"X-Request-ID": context.request_id},
+        )
     except PolicyViolationError as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        await db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "detail": str(e),
+                "error_code": ToolErrorCode.POLICY_VIOLATION.value,
+                "message": str(e),
+                "request_id": context.request_id,
+                "retryable": False,
+            },
+            headers={"X-Request-ID": context.request_id},
+        )
     except ToolValidationError as e:
-        raise HTTPException(
+        await db.commit()
+        return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"message": str(e), "errors": e.errors},
+            content={
+                "detail": e.message,
+                "error_code": ToolErrorCode.VALIDATION_ERROR.value,
+                "message": e.message,
+                "request_id": context.request_id,
+                "retryable": False,
+                "errors": e.errors,
+            },
+            headers={"X-Request-ID": context.request_id},
+        )
+    except InFlightRequestError as e:
+        await db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": e.message,
+                "error_code": ToolErrorCode.RATE_LIMITED.value,
+                "message": e.message,
+                "request_id": context.request_id,
+                "retryable": False,
+            },
+            headers={"X-Request-ID": context.request_id},
+        )
+    except ToolTimeoutError as e:
+        await db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={
+                "detail": e.message,
+                "error_code": ToolErrorCode.TIMEOUT_ERROR.value,
+                "message": e.message,
+                "request_id": context.request_id,
+                "retryable": True,
+            },
+            headers={"X-Request-ID": context.request_id},
+        )
+    except ToolAdapterError as e:
+        await db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "detail": e.message,
+                "error_code": ToolErrorCode.ADAPTER_ERROR.value,
+                "message": e.message,
+                "request_id": context.request_id,
+                "retryable": True,
+            },
+            headers={"X-Request-ID": context.request_id},
         )
     except Exception as e:
-        raise HTTPException(
+        await db.commit()
+        return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"1C tool execution failed: {str(e)}",
+            content={
+                "detail": f"1C tool execution failed: {str(e)}",
+                "error_code": ToolErrorCode.INTERNAL_ERROR.value,
+                "message": f"1C tool execution failed: {str(e)}",
+                "request_id": context.request_id,
+                "retryable": False,
+            },
+            headers={"X-Request-ID": context.request_id},
         )
 
 
@@ -106,6 +203,9 @@ async def get_tool_execution_history(
             latency_ms=c.latency_ms,
             params=c.params or {},
             error=c.error,
+            error_code=c.error_code,
+            request_id=c.request_id,
+            idempotency_key=c.idempotency_key,
             created_at=c.created_at,
         )
         for c in calls

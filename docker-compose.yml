@@ -57,6 +57,8 @@ services:
       - CORS_ORIGINS=["http://localhost:5173","http://localhost:80","http://localhost"]
       - UPLOAD_DIR=/app/uploads
       - ONEC_CREDENTIALS_ENCRYPTION_KEY=${ONEC_CREDENTIALS_ENCRYPTION_KEY:-default-insecure-dev-fernet-key-32bytes-min}
+      - ONEC_TOOL_TIMEOUT_SECONDS=${ONEC_TOOL_TIMEOUT_SECONDS:-30}
+      - ONEC_TOOL_RETRIES=${ONEC_TOOL_RETRIES:-1}
     ports:
       - "8000:8000"
     volumes:

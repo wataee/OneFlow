@@ -110,12 +110,23 @@
             :title="executionResult.error ? 'Ошибка выполнения' : 'Результат выполнения'"
             style="margin-bottom: 8px;"
           >
-            <span v-if="executionResult.error">{{ executionResult.error }}</span>
-            <span v-else>
-              Риск: {{ executionResult.risk_level }} |
-              Режим: {{ executionResult.dry_run ? 'Dry Run' : 'Executed' }} |
-              Mock: {{ executionResult.is_mock }}
-            </span>
+            <div v-if="executionResult.error">
+              <div>{{ executionResult.error }}</div>
+              <div v-if="executionResult.error_code" style="font-size: 11px; margin-top: 4px; opacity: 0.9;">
+                Код ошибки: <strong>{{ executionResult.error_code }}</strong>
+                <span v-if="executionResult.request_id"> | Request ID: <code>{{ executionResult.request_id }}</code></span>
+              </div>
+            </div>
+            <div v-else>
+              <div>
+                Риск: {{ executionResult.risk_level }} |
+                Режим: {{ executionResult.dry_run ? 'Dry Run' : 'Executed' }} |
+                Mock: {{ executionResult.is_mock }}
+              </div>
+              <div v-if="executionResult.request_id" style="font-size: 11px; margin-top: 4px; opacity: 0.9;">
+                Request ID: <code>{{ executionResult.request_id }}</code>
+              </div>
+            </div>
           </n-alert>
 
           <pre class="result-box">{{ JSON.stringify(executionResult.data || executionResult, null, 2) }}</pre>
@@ -247,6 +258,15 @@ const historyColumns = [
     },
   },
   {
+    title: 'Код ошибки',
+    key: 'error_code',
+    width: 150,
+    render(row: any) {
+      if (!row.error_code) return '—';
+      return h(NTag, { size: 'small', type: 'error' }, { default: () => row.error_code });
+    },
+  },
+  {
     title: 'Latency',
     key: 'latency_ms',
     width: 90,
@@ -320,9 +340,23 @@ const submitExecution = async () => {
     message.success(isDryRun.value ? 'Dry-Run успешно завершен' : 'Инструмент успешно выполнен');
     fetchHistory();
   } catch (err: any) {
-    const detail = err.response?.data?.detail;
-    const msg = typeof detail === 'string' ? detail : JSON.stringify(detail);
-    executionResult.value = { error: msg || err.message };
+    const data = err.response?.data;
+    const detail = data?.detail;
+    let errorCode = data?.error_code;
+    let requestId = err.response?.headers?.['x-request-id'] || data?.request_id;
+    let msg = '';
+    if (typeof detail === 'object' && detail !== null) {
+      msg = detail.message || JSON.stringify(detail);
+      errorCode = errorCode || detail.error_code;
+      requestId = requestId || detail.request_id;
+    } else {
+      msg = typeof detail === 'string' ? detail : err.message;
+    }
+    executionResult.value = {
+      error: msg,
+      error_code: errorCode,
+      request_id: requestId,
+    };
     message.error('Ошибка выполнения инструмента');
     fetchHistory();
   } finally {

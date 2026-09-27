@@ -12,13 +12,47 @@ from app.api.v1.onec import router as onec_router
 from app.api.v1.onec_connection import router as onec_connection_router
 from app.api.v1.review import router as review_router
 from app.api.v1.tasks import router as tasks_router
+import re
+
 from app.api.v1.tools import router as tools_router
 from app.integrations.onec.mcp_server import mcp_router
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, Base, engine
 
+
+class TokenMaskFilter(logging.Filter):
+    """
+    Sanitizes log records by redacting sensitive token query parameters
+    (e.g., ?token=... or &token=...) from log messages and formatting args.
+    """
+    _PATTERN = re.compile(r"([?&]token=)[^&\s]+", re.IGNORECASE)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1***", record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: (self._PATTERN.sub(r"\1***", v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                }
+            elif isinstance(record.args, tuple):
+                record.args = tuple(
+                    (self._PATTERN.sub(r"\1***", a) if isinstance(a, str) else a)
+                    for a in record.args
+                )
+        return True
+
+
+token_mask_filter = TokenMaskFilter()
 logging.basicConfig(level=logging.INFO if settings.DEBUG else logging.WARNING)
+logging.getLogger().addFilter(token_mask_filter)
+logging.getLogger("uvicorn.access").addFilter(token_mask_filter)
+logging.getLogger("uvicorn.error").addFilter(token_mask_filter)
+logging.getLogger("app.mcp").addFilter(token_mask_filter)
+
 logger = logging.getLogger("app.main")
+logger.addFilter(token_mask_filter)
 
 
 async def init_db_and_triggers():

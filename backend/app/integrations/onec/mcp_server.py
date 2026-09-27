@@ -14,6 +14,7 @@ Architecture:
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -28,8 +29,12 @@ from app.integrations.onec.policy import PolicyViolationError
 from app.integrations.onec.tools import tool_registry
 from app.services.tool_service import (
     ExecutionContext,
+    InFlightRequestError,
+    ToolAdapterError,
+    ToolErrorCode,
     ToolExecutionService,
     ToolNotFoundError,
+    ToolTimeoutError,
     ToolValidationError,
 )
 
@@ -37,8 +42,11 @@ logger = logging.getLogger("app.mcp")
 
 mcp_router = APIRouter()
 
-# Active SSE sessions: session_id -> {"user": CurrentUserContext, "queue": asyncio.Queue}
+# Active SSE sessions: session_id -> {"user": CurrentUserContext, "queue": asyncio.Queue, "created_at": float, "last_active": float}
 _active_sse_sessions: Dict[str, Dict[str, Any]] = {}
+_sse_lock = asyncio.Lock()
+MAX_SSE_SESSIONS = 1000
+SSE_SESSION_TTL_SECONDS = 1800  # 30 minutes
 
 
 # =============================================================================
@@ -100,7 +108,16 @@ def authenticate_mcp_request(
 
     # Check existing authenticated SSE session
     if session_id and session_id in _active_sse_sessions:
-        return _active_sse_sessions[session_id]["user"]
+        session_info = _active_sse_sessions[session_id]
+        if time.time() - session_info.get("last_active", session_info.get("created_at", 0)) > SSE_SESSION_TTL_SECONDS:
+            _active_sse_sessions.pop(session_id, None)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="MCP SSE session has expired due to inactivity",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        session_info["last_active"] = time.time()
+        return session_info["user"]
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -114,12 +131,13 @@ def authenticate_mcp_request(
 # =============================================================================
 
 async def handle_initialize(req_id: Any, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Handles MCP 'initialize' handshake."""
+    """Handles MCP 'initialize' handshake with protocol version echo."""
+    client_proto = params.get("protocolVersion") or "2024-11-05"
     return {
         "jsonrpc": "2.0",
         "id": req_id,
         "result": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": client_proto,
             "capabilities": {
                 "tools": {"listChanged": False},
             },
@@ -131,14 +149,24 @@ async def handle_initialize(req_id: Any, params: Dict[str, Any]) -> Dict[str, An
     }
 
 
-async def handle_list_tools(req_id: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_list_tools(
+    req_id: Any,
+    params: Dict[str, Any],
+    current_user: CurrentUserContext,
+) -> Dict[str, Any]:
     """
     Handles MCP 'tools/list' discovery request.
-    Dynamically reflects all registered tools from tool_registry.
+    Dynamically reflects tools matching current tenant's effective risk ceiling.
     """
+    async with AsyncSessionLocal() as db:
+        service = ToolExecutionService(
+            session=db,
+            organization_id=current_user.organization_id,
+        )
+        tools = await service.list_tools_for_tenant()
+
     tools_list = []
-    for tool_def in tool_registry.list():
-        # Input schema generated from Pydantic model
+    for tool_def in tools:
         schema = tool_def.input_schema_class.model_json_schema()
         description = (
             f"{tool_def.description} "
@@ -168,14 +196,28 @@ async def handle_call_tool(
     """
     Handles MCP 'tools/call' invocation request.
     Delegates to ToolExecutionService with ExecutionContext(source='mcp').
-    Returns CallToolResult with isError=True on failure/policy violation.
+    Returns CallToolResult with compact JSON error payloads on failure.
     """
     tool_name = params.get("name")
     arguments = params.get("arguments", {})
 
+    meta = params.get("_meta") or {}
+    idempotency_key = (
+        meta.get("idempotency_key")
+        or params.get("idempotency_key")
+        or arguments.get("_idempotency_key")
+    )
+    request_id = meta.get("request_id") or (str(req_id) if req_id is not None else str(uuid.uuid4()))
+
     if not tool_name:
+        err_body = {
+            "error_code": ToolErrorCode.VALIDATION_ERROR.value,
+            "message": "Missing required parameter 'name'",
+            "request_id": request_id,
+            "retryable": False,
+        }
         call_res = types.CallToolResult(
-            content=[types.TextContent(type="text", text="Missing required parameter 'name'")],
+            content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
             isError=True,
         )
         return {
@@ -189,6 +231,8 @@ async def handle_call_tool(
         organization_id=current_user.organization_id,
         role=current_user.role,
         source="mcp",
+        request_id=request_id,
+        idempotency_key=idempotency_key,
     )
 
     async with AsyncSessionLocal() as db:
@@ -210,32 +254,99 @@ async def handle_call_tool(
             )
         except PolicyViolationError as pve:
             await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.POLICY_VIOLATION.value,
+                "message": f"Policy violation: {pve}",
+                "request_id": ctx.request_id,
+                "retryable": False,
+            }
             call_res = types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Policy violation: {pve}")],
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
                 isError=True,
             )
         except ToolValidationError as tve:
             await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.VALIDATION_ERROR.value,
+                "message": f"Validation error: {tve.message}",
+                "request_id": ctx.request_id,
+                "retryable": False,
+                "errors": tve.errors,
+            }
             call_res = types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Validation error: {tve.message}")],
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
                 isError=True,
             )
         except ToolNotFoundError as tnfe:
             await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.TOOL_NOT_FOUND.value,
+                "message": f"Tool not found: {tnfe.message}",
+                "request_id": ctx.request_id,
+                "retryable": False,
+            }
             call_res = types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Tool not found: {tnfe}")],
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
+                isError=True,
+            )
+        except InFlightRequestError as ifre:
+            await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.RATE_LIMITED.value,
+                "message": f"In-flight request conflict: {ifre.message}",
+                "request_id": ctx.request_id,
+                "retryable": False,
+            }
+            call_res = types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
+                isError=True,
+            )
+        except ToolTimeoutError as tte:
+            await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.TIMEOUT_ERROR.value,
+                "message": f"Timeout error: {tte.message}",
+                "request_id": ctx.request_id,
+                "retryable": True,
+            }
+            call_res = types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
+                isError=True,
+            )
+        except ToolAdapterError as tae:
+            await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.ADAPTER_ERROR.value,
+                "message": f"Adapter error: {tae.message}",
+                "request_id": ctx.request_id,
+                "retryable": True,
+            }
+            call_res = types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
                 isError=True,
             )
         except HTTPException as he:
             await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.INTERNAL_ERROR.value,
+                "message": f"HTTP error: {he.detail}",
+                "request_id": ctx.request_id,
+                "retryable": False,
+            }
             call_res = types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"HTTP error: {he.detail}")],
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
                 isError=True,
             )
         except Exception as exc:
             await db.commit()
+            err_body = {
+                "error_code": ToolErrorCode.INTERNAL_ERROR.value,
+                "message": f"Execution error: {str(exc)}",
+                "request_id": ctx.request_id,
+                "retryable": False,
+            }
             call_res = types.CallToolResult(
-                content=[types.TextContent(type="text", text=f"Execution error: {str(exc)}")],
+                content=[types.TextContent(type="text", text=json.dumps(err_body, ensure_ascii=False))],
                 isError=True,
             )
 
@@ -263,7 +374,7 @@ async def process_jsonrpc_request(
         }
 
     # Notifications do not return responses
-    if method == "notifications/initialized":
+    if method in ("notifications/initialized", "notifications/cancelled"):
         return None
 
     if method == "ping":
@@ -273,7 +384,7 @@ async def process_jsonrpc_request(
         return await handle_initialize(req_id, params)
 
     if method == "tools/list":
-        return await handle_list_tools(req_id, params)
+        return await handle_list_tools(req_id, params, current_user)
 
     if method == "tools/call":
         return await handle_call_tool(req_id, params, current_user)
@@ -341,15 +452,34 @@ async def handle_sse_endpoint(request: Request, single_event: bool = False):
     """
     Standard MCP SSE connection endpoint.
     Client establishes persistent SSE connection and receives the relative messages POST URI.
+    Enforces concurrency cap (1000) and idle TTL (30 min).
     """
     current_user = authenticate_mcp_request(request)
-    session_id = uuid.uuid4().hex
-    queue: asyncio.Queue = asyncio.Queue()
 
-    _active_sse_sessions[session_id] = {
-        "user": current_user,
-        "queue": queue,
-    }
+    async with _sse_lock:
+        now = time.time()
+        # Sweep expired sessions
+        expired = [
+            sid for sid, s in _active_sse_sessions.items()
+            if now - s.get("last_active", s.get("created_at", now)) > SSE_SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            _active_sse_sessions.pop(sid, None)
+
+        if len(_active_sse_sessions) >= MAX_SSE_SESSIONS:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Maximum concurrent MCP SSE sessions reached (cap=1000). Please retry later.",
+            )
+
+        session_id = uuid.uuid4().hex
+        queue: asyncio.Queue = asyncio.Queue()
+        _active_sse_sessions[session_id] = {
+            "user": current_user,
+            "queue": queue,
+            "created_at": now,
+            "last_active": now,
+        }
 
     async def sse_event_generator():
         # 1. Send endpoint event pointing to /mcp/messages
@@ -373,7 +503,8 @@ async def handle_sse_endpoint(request: Request, single_event: bool = False):
         except (asyncio.CancelledError, GeneratorExit):
             pass
         finally:
-            _active_sse_sessions.pop(session_id, None)
+            async with _sse_lock:
+                _active_sse_sessions.pop(session_id, None)
 
     return StreamingResponse(
         sse_event_generator(),
@@ -409,9 +540,16 @@ async def handle_post_messages(request: Request, session_id: Optional[str] = Non
     response = await process_jsonrpc_request(body, current_user)
 
     # If active SSE session, send response via SSE stream
-    if session_id and session_id in _active_sse_sessions and response is not None:
-        await _active_sse_sessions[session_id]["queue"].put(response)
-        return JSONResponse(status_code=202, content={"status": "accepted"})
+    if session_id:
+        target_queue = None
+        async with _sse_lock:
+            if session_id in _active_sse_sessions:
+                _active_sse_sessions[session_id]["last_active"] = time.time()
+                target_queue = _active_sse_sessions[session_id]["queue"]
+
+        if target_queue and response is not None:
+            await target_queue.put(response)
+            return JSONResponse(status_code=202, content={"status": "accepted"})
 
     if response is None:
         return Response(status_code=204)

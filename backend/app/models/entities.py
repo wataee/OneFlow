@@ -255,9 +255,13 @@ class ToolCall(Base):
     risk_level: Mapped[str] = mapped_column(String(50), nullable=False)
     is_dry_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     params: Mapped[Dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False)  # SUCCESS, FAILED, BLOCKED
+    status: Mapped[str] = mapped_column(String(50), nullable=False)  # SUCCESS, FAILED, BLOCKED, RUNNING
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    result_payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONType, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )
@@ -268,5 +272,6 @@ class ToolCall(Base):
     __table_args__ = (
         Index("ix_tool_calls_org_tool", "organization_id", "tool_name"),
         Index("ix_tool_calls_org_created", "organization_id", "created_at"),
+        Index("ix_tool_calls_org_idempotency", "organization_id", "idempotency_key"),
     )
 

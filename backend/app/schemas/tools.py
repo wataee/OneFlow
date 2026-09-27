@@ -16,6 +16,8 @@ class ToolExecuteRequest(BaseModel):
     tool_name: str = Field(description="Name of tool to execute")
     params: Dict[str, Any] = Field(default_factory=dict, description="Typed arguments matching tool schema")
     dry_run: bool = Field(default=False, description="Simulate execution without external side-effects")
+    idempotency_key: Optional[str] = Field(default=None, description="Client idempotency key")
+    request_id: Optional[str] = Field(default=None, description="Client request correlation ID")
 
 
 class ToolExecuteResponse(BaseModel):
@@ -25,6 +27,8 @@ class ToolExecuteResponse(BaseModel):
     is_truncated: bool = False
     is_mock: bool = False
     dry_run: bool = False
+    request_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 class ToolCallHistoryItem(BaseModel):
@@ -36,4 +40,7 @@ class ToolCallHistoryItem(BaseModel):
     latency_ms: Optional[int] = None
     params: Dict[str, Any]
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    request_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
     created_at: datetime

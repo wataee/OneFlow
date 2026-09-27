@@ -249,7 +249,11 @@ class ToolCallRepository(BaseRepository[ToolCall]):
         is_dry_run: bool = False,
         latency_ms: Optional[int] = None,
         error: Optional[str] = None,
+        error_code: Optional[str] = None,
         user_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        result_payload: Optional[Dict[str, Any]] = None,
     ) -> ToolCall:
         record = ToolCall(
             organization_id=self.organization_id,
@@ -260,9 +264,52 @@ class ToolCallRepository(BaseRepository[ToolCall]):
             params=params,
             status=status,
             error=error,
+            error_code=error_code,
             latency_ms=latency_ms,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            result_payload=result_payload,
         )
         return await self.create(record)
+
+    async def get_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> Optional[ToolCall]:
+        stmt = (
+            select(ToolCall)
+            .where(
+                ToolCall.organization_id == self.organization_id,
+                ToolCall.idempotency_key == idempotency_key,
+            )
+            .order_by(ToolCall.created_at.desc())
+        )
+        res = await self.session.execute(stmt)
+        return res.scalars().first()
+
+    async def claim_in_flight(
+        self,
+        tool_name: str,
+        risk_level: str,
+        params: Dict[str, Any],
+        idempotency_key: str,
+        request_id: str,
+        user_id: Optional[str] = None,
+    ) -> ToolCall:
+        record = ToolCall(
+            organization_id=self.organization_id,
+            user_id=user_id,
+            tool_name=tool_name,
+            risk_level=risk_level,
+            is_dry_run=False,
+            params=params,
+            status="RUNNING",
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+        )
+        self.session.add(record)
+        await self.session.flush()
+        return record
 
     async def list_recent_calls(
         self,

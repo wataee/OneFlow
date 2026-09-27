@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     ONEC_READ_ONLY_MODE: bool = True
     ONEC_MAX_RISK_LEVEL: str = "ANALYTICS_READ"
     ONEC_OUTPUT_MAX_ROWS: int = 100
+    ONEC_TOOL_TIMEOUT_SECONDS: int = 30
+    ONEC_TOOL_RETRIES: int = 1
     # Symmetric encryption key for per-tenant stored credentials.
     # INSECURE WARNING: If unset in development, a key derived from JWT_SECRET_KEY is used.
     # In production, set a dedicated 32-byte urlsafe-base64 Fernet key.
