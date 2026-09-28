@@ -22,6 +22,7 @@ export interface User {
   email: string;
   full_name: string;
   role: UserRole;
+  business_role?: 'ACCOUNTANT' | 'WAREHOUSE' | 'PROCUREMENT' | 'MANAGER' | 'OWNER' | null;
   is_active: boolean;
   created_at: string;
 }

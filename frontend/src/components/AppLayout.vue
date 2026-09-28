@@ -117,6 +117,11 @@ const menuOptions = [
     icon: () => h('span', '🛠️'),
   },
   {
+    label: 'Daily Guard',
+    key: 'daily-guard',
+    icon: () => h('span', '🛡️'),
+  },
+  {
     label: 'Настройки',
     key: 'settings',
     icon: () => h('span', '⚙️'),

@@ -7,6 +7,7 @@ from sqlalchemy import text
 from app.api.v1.audit import router as audit_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.dashboard import router as dashboard_router
+from app.api.v1.daily_guard import router as daily_guard_router
 from app.api.v1.files import router as files_router
 from app.api.v1.onec import router as onec_router
 from app.api.v1.onec_connection import router as onec_connection_router
@@ -166,6 +167,7 @@ api_v1.include_router(review_router)
 api_v1.include_router(files_router)
 api_v1.include_router(dashboard_router)
 api_v1.include_router(audit_router)
+api_v1.include_router(daily_guard_router)
 
 app.mount(settings.API_V1_PREFIX, api_v1)
 app.include_router(mcp_router, prefix="/mcp")

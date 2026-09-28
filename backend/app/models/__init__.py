@@ -11,6 +11,7 @@ from app.models.entities import (
     ReviewDecision,
     AuditLog,
     FileMetadata,
+    BusinessRole, Finding, FindingStatus, FindingSeverity, ScanRun, ScanRunStatus, ScanTriggerType,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "ReviewDecision",
     "AuditLog",
     "FileMetadata",
+    "BusinessRole", "Finding", "FindingStatus", "FindingSeverity", "ScanRun", "ScanRunStatus", "ScanTriggerType",
 ]

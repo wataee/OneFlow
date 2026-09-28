@@ -10,6 +10,7 @@ async def test_auth_registration_and_login(client: AsyncClient):
         "password": "StrongPassword123!",
         "full_name": "Бауржан Сейфуллин",
         "organization_name": "ТОО Байтерек Финанс",
+        "business_role": "ACCOUNTANT",
     }
     reg_resp = await client.post("/api/v1/auth/register", json=reg_payload)
     assert reg_resp.status_code == 201
@@ -34,6 +35,7 @@ async def test_auth_registration_and_login(client: AsyncClient):
     me_data = me_resp.json()
     assert me_data["email"] == "cfo@company.kz"
     assert me_data["role"] == "admin"
+    assert me_data["business_role"] == "ACCOUNTANT"
 
 
 @pytest.mark.asyncio

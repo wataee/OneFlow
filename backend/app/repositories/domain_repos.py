@@ -13,6 +13,7 @@ from app.models.entities import (
     TaskStatus,
     ToolCall,
     User,
+    Finding, FindingStatus, FindingSeverity, BusinessRole, ScanRun, ScanRunStatus,
 )
 from app.repositories.base import BaseRepository, MultiTenantViolationError
 
@@ -123,6 +124,92 @@ class AuditRepository(BaseRepository[AuditLog]):
         raise NotImplementedError("Audit logs are strictly append-only and immutable. Deletions are forbidden.")
 
 
+class FindingRepository(BaseRepository[Finding]):
+    model_cls = Finding
+
+    async def list_for_organization(self, limit=50, offset=0, **filters):
+        stmt = self._apply_tenant_filter(select(Finding))
+        for key, value in filters.items():
+            if value is not None and hasattr(Finding, key):
+                stmt = stmt.where(getattr(Finding, key) == value)
+        if filters.get("since"):
+            stmt = stmt.where(Finding.created_at >= filters["since"])
+        if filters.get("until"):
+            stmt = stmt.where(Finding.created_at <= filters["until"])
+        count = await self.session.scalar(select(func.count()).select_from(stmt.subquery()))
+        result = await self.session.execute(stmt.order_by(Finding.last_seen_at.desc()).limit(limit).offset(offset))
+        return list(result.scalars().all()), count or 0
+
+    async def list_open(self, **filters):
+        return await self.list_for_organization(status=FindingStatus.OPEN, **filters)
+
+    async def list_by_business_role(self, business_role, limit=50, offset=0):
+        return await self.list_for_organization(business_role=business_role, limit=limit, offset=offset)
+
+    async def get_by_fingerprint(self, fingerprint):
+        result = await self.session.execute(select(Finding).where(
+            Finding.organization_id == self.organization_id, Finding.fingerprint == fingerprint))
+        return result.scalars().first()
+
+    async def upsert_by_fingerprint(self, candidate, fingerprint: str, now=None):
+        """Create a finding or refresh/reopen its single tenant-scoped logical issue."""
+        now = now or datetime.now(timezone.utc)
+        item = await self.get_by_fingerprint(fingerprint)
+        if item is None:
+            item = Finding(organization_id=self.organization_id, rule_code=candidate.rule_code,
+                rule_version=candidate.rule_version, status=FindingStatus.NEW, severity=candidate.severity,
+                title=candidate.title, description=candidate.description, business_role=candidate.business_role,
+                entity_type=candidate.entity_type, entity_id=candidate.entity_id, fingerprint=fingerprint,
+                evidence=candidate.evidence or {}, metadata_json=candidate.metadata or {},
+                first_seen_at=now, last_seen_at=now)
+            return await self.create(item), True, False
+        reopened = item.status == FindingStatus.RESOLVED
+        item.last_seen_at, item.evidence = now, candidate.evidence or {}
+        item.title, item.description, item.severity = candidate.title, candidate.description, candidate.severity
+        item.rule_version, item.metadata_json = candidate.rule_version, candidate.metadata or {}
+        if reopened:
+            item.status, item.resolved_at = FindingStatus.OPEN, None
+            item.acknowledged_at, item.acknowledged_by = None, None
+        elif item.status == FindingStatus.NEW:
+            item.status = FindingStatus.OPEN
+        await self.session.flush()
+        return item, False, reopened
+
+    async def resolve(self, entity_id: str, resolved_at=None):
+        item = await self.get_by_id(entity_id)
+        if item and item.status != FindingStatus.RESOLVED:
+            item.status = FindingStatus.RESOLVED
+            item.resolved_at = resolved_at or datetime.now(timezone.utc)
+            await self.session.flush()
+        return item
+
+    async def acknowledge(self, entity_id, user_id):
+        item = await self.get_by_id(entity_id)
+        if item and item.status != FindingStatus.RESOLVED:
+            item.status = FindingStatus.ACKNOWLEDGED
+            item.acknowledged_at = datetime.now(timezone.utc)
+            item.acknowledged_by = user_id
+            await self.session.flush()
+        return item
+
+    async def summary_counts(self, business_role=None):
+        stmt = select(Finding.severity, func.count(Finding.id)).where(
+            Finding.organization_id == self.organization_id, Finding.status.in_([FindingStatus.NEW, FindingStatus.OPEN, FindingStatus.ACKNOWLEDGED]))
+        if business_role:
+            stmt = stmt.where(Finding.business_role == business_role)
+        return {severity.value if hasattr(severity, "value") else severity: count for severity, count in (await self.session.execute(stmt.group_by(Finding.severity))).all()}
+
+
+class ScanRepository(BaseRepository[ScanRun]):
+    model_cls = ScanRun
+
+    async def get_active(self):
+        result = await self.session.execute(select(ScanRun).where(
+            ScanRun.organization_id == self.organization_id,
+            ScanRun.status.in_([ScanRunStatus.PENDING, ScanRunStatus.RUNNING])))
+        return result.scalars().first()
+
+
 class FileRepository(BaseRepository[FileMetadata]):
     model_cls = FileMetadata
 
@@ -220,6 +307,7 @@ class AuthGlobalRepository:
         hashed_password: str,
         full_name: str,
         role: str = "admin",
+        business_role=None,
     ) -> User:
         user = User(
             organization_id=organization_id,
@@ -227,6 +315,7 @@ class AuthGlobalRepository:
             hashed_password=hashed_password,
             full_name=full_name,
             role=role,
+            business_role=business_role,
         )
         self.session.add(user)
         await self.session.flush()
@@ -329,4 +418,3 @@ class ToolCallRepository(BaseRepository[ToolCall]):
             stmt = stmt.where(ToolCall.is_dry_run == is_dry_run)
         res = await self.session.execute(stmt)
         return list(res.scalars().all())
-

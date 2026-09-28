@@ -59,6 +59,7 @@ services:
       - ONEC_CREDENTIALS_ENCRYPTION_KEY=${ONEC_CREDENTIALS_ENCRYPTION_KEY:-default-insecure-dev-fernet-key-32bytes-min}
       - ONEC_TOOL_TIMEOUT_SECONDS=${ONEC_TOOL_TIMEOUT_SECONDS:-30}
       - ONEC_TOOL_RETRIES=${ONEC_TOOL_RETRIES:-1}
+      - DAILY_GUARD_SCAN_TIME=${DAILY_GUARD_SCAN_TIME:-06:00}
     ports:
       - "8000:8000"
     volumes:
@@ -95,9 +96,32 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - UPLOAD_DIR=/app/uploads
       - ONEC_CREDENTIALS_ENCRYPTION_KEY=${ONEC_CREDENTIALS_ENCRYPTION_KEY:-default-insecure-dev-fernet-key-32bytes-min}
+      - DAILY_GUARD_SCAN_TIME=${DAILY_GUARD_SCAN_TIME:-06:00}
     volumes:
       - uploads_data:/app/uploads
     command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=2
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: oneflow_celery_beat
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - ENV=production
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-oneflow_db}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DAILY_GUARD_SCAN_TIME=${DAILY_GUARD_SCAN_TIME:-06:00}
+      - DEMO_MODE=${DEMO_MODE:-true}
+      - ONEC_CREDENTIALS_ENCRYPTION_KEY=${ONEC_CREDENTIALS_ENCRYPTION_KEY:-default-insecure-dev-fernet-key-32bytes-min}
+    command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
 
   frontend:
     build:

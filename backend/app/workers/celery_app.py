@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from celery import Celery
+from celery.schedules import crontab
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,78 @@ celery_app.conf.update(
         "socket_connect_timeout": 1.0,
     },
 )
+
+try:
+    _hour, _minute = (int(part) for part in settings.DAILY_GUARD_SCAN_TIME.split(":"))
+except (TypeError, ValueError):
+    raise ValueError("DAILY_GUARD_SCAN_TIME must use UTC HH:MM format")
+if not (0 <= _hour <= 23 and 0 <= _minute <= 59):
+    raise ValueError("DAILY_GUARD_SCAN_TIME must use UTC HH:MM format")
+celery_app.conf.beat_schedule = {
+    "daily-guard-scan-dispatch": {
+        "task": "dispatch_daily_guard_scans",
+        "schedule": crontab(hour=_hour, minute=_minute),
+    }
+}
+
+
+@celery_app.task(name="run_daily_guard_scan")
+def run_daily_guard_scan(run_id: str, organization_id: str):
+    async def _run():
+        from app.core.database import AsyncSessionLocal
+        from app.services.daily_guard_service import DailyGuardService
+        async with AsyncSessionLocal() as session:
+            service = DailyGuardService(session, organization_id)
+            run = await service.execute_scan(run_id)
+            await session.commit()
+            return {"scan_id": run_id, "status": run.status.value if run else "MISSING"}
+    return asyncio.run(_run())
+
+
+@celery_app.task(name="dispatch_daily_guard_scans")
+def dispatch_daily_guard_scans():
+    async def _dispatch():
+        from sqlalchemy import select
+        from app.core.database import AsyncSessionLocal
+        from app.core.config import settings as app_settings
+        from app.models.entities import Organization, User
+        from app.services.daily_guard_service import ActiveScanError, DailyGuardService
+        scheduled = []
+        async with AsyncSessionLocal() as session:
+            organizations = (await session.execute(select(Organization).where(
+                select(User.id).where(User.organization_id == Organization.id, User.is_active.is_(True)).exists()
+            ))).scalars().all()
+            for org in organizations:
+                cfg = org.onec_config or {}
+                if not app_settings.DEMO_MODE and not (cfg.get("base_url") or app_settings.ONEC_ODATA_URL):
+                    continue
+                try:
+                    run = await DailyGuardService(session, org.id).start_scan(ScanTriggerType.SCHEDULED)
+                    await session.commit()
+                    scheduled.append((run.id, org.id))
+                except ActiveScanError:
+                    await session.rollback()
+        for run_id, org_id in scheduled:
+            try:
+                run_daily_guard_scan.delay(run_id, org_id)
+            except Exception:
+                logger.exception("Unable to enqueue scheduled Daily Guard scan %s", run_id)
+                async with AsyncSessionLocal() as session:
+                    from datetime import datetime, timezone
+                    from app.models.entities import ScanRun, ScanRunStatus
+                    from app.services.audit_service import AuditService
+                    run = await session.scalar(select(ScanRun).where(
+                        ScanRun.id == run_id, ScanRun.organization_id == org_id))
+                    if run:
+                        run.status, run.error_code = ScanRunStatus.FAILED, "QUEUE_UNAVAILABLE"
+                        run.error_message = "Could not enqueue scheduled Daily Guard scan."
+                        run.finished_at = datetime.now(timezone.utc)
+                        await AuditService(session, org_id).log_event("DAILY_GUARD_SCAN_FAILED", "ScanRun", run.id,
+                            new_values={"error_code": run.error_code})
+                        await session.commit()
+        return {"scheduled": len(scheduled)}
+    from app.models.entities import ScanTriggerType
+    return asyncio.run(_dispatch())
 
 
 @celery_app.task(name="process_task_job", bind=True, max_retries=settings.MAX_TASK_RETRIES)

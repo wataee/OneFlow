@@ -625,3 +625,31 @@ OneFlow предоставляет стандартизированный MCP-и
   * Роль: Источник паттернов безопасности (двойной предохранитель записи, учет особенности OData с символом `+` / `%20`, таксономия наименования операций `read.<category>.<action>`).
 
 Полный текст лицензий и официальные уведомления зафиксированы в файле [THIRD_PARTY_NOTICES.md](file:///c:/Users/timur/OneDrive/Рабочий%20стол/RPROJECT%20X/THIRD_PARTY_NOTICES.md).
+
+## Daily Guard (foundation)
+
+Daily Guard runs conservative, read-only diagnostics against a tenant's 1C data. Its first stage stores rule observations as persistent findings; it does not produce AI explanations or write to 1C.
+
+```text
+1C
+↓
+Diagnostic Rules
+↓
+DailyGuardService
+↓
+FindingRepository
+↓
+Findings
+↓
+Daily Guard UI
+```
+
+`ScanRun` records one tenant scan, its trigger (`MANUAL` or `SCHEDULED`), progress, outcome, and finding counters. Rules implement `DiagnosticRule.check(ScanContext)` and return `FindingCandidate` values. Register a rule with `rule_registry.register(MyRule())`; use `context.onec_service` / `context.execute_tool()` so reads pass through OneFlow's existing 1C policy, adapter, filtering, telemetry, and audit pipeline. The initial demo registry contains `documents.unposted`, `warehouse.inventory_check`, and `debtors.overdue`.
+
+Finding identity is SHA-256 over organization, rule, and entity identity. A repeat observation updates the same row and refreshes `last_seen_at`; a resolved row is reopened as `OPEN` if observed again. A completed scan resolves findings for rules that completed successfully and did not return that finding. If any rule fails, the run fails and no disappearance-based resolution is applied.
+
+Authorization roles (`ADMIN` / `USER`) are unchanged. Optional `business_role` is separate and currently accepts `ACCOUNTANT`, `WAREHOUSE`, `PROCUREMENT`, `MANAGER`, and `OWNER`; findings are tagged with the role responsible for the issue, and a user's role is the default summary filter.
+
+Run a scan with `POST /api/v1/scans` (admin only); it returns `202` and enqueues execution in Celery. Find scan history at `GET /api/v1/scans`, status at `GET /api/v1/scans/{id}`, and findings at `GET /api/v1/findings`. Finding filters include status, severity, business role, rule code, `date_from`, and `date_to`; `GET /api/v1/findings/summary` supplies the dashboard counts. `POST /api/v1/findings/{id}/acknowledge` records acknowledgement. All endpoints are scoped to the authenticated organization.
+
+Celery Beat dispatches one daily scan at `DAILY_GUARD_SCAN_TIME` (UTC `HH:MM`, default `06:00`). Run both the existing Celery worker and Beat process. A tenant needs an active user; outside `DEMO_MODE`, it also needs a configured 1C `base_url`. An organization can have only one pending/running scan at a time, enforced by a partial unique database index. Seed users include business roles; demo findings are created by running the actual rules, not by inserting sample finding rows.

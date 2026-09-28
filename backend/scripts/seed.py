@@ -22,6 +22,7 @@ from app.models.entities import (
     TaskType,
     User,
     UserRole,
+    BusinessRole,
 )
 
 
@@ -50,6 +51,7 @@ async def seed_data():
             hashed_password=get_password_hash("Secret123!"),
             full_name="Ерлан Каримов",
             role=UserRole.ADMIN,
+            business_role=BusinessRole.OWNER,
         )
         # Regular accountant user
         user_a = User(
@@ -58,6 +60,7 @@ async def seed_data():
             hashed_password=get_password_hash("Secret123!"),
             full_name="Айгерим Смагулова",
             role=UserRole.USER,
+            business_role=BusinessRole.ACCOUNTANT,
         )
         session.add_all([admin_a, user_a])
         await session.flush()
@@ -73,6 +76,7 @@ async def seed_data():
             hashed_password=get_password_hash("Secret123!"),
             full_name="Марат Омаров",
             role=UserRole.ADMIN,
+            business_role=BusinessRole.MANAGER,
         )
         session.add(other_user)
 

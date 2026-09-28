@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     # In production, set a dedicated 32-byte urlsafe-base64 Fernet key.
     ONEC_CREDENTIALS_ENCRYPTION_KEY: Optional[str] = None
 
+    # Daily Guard Settings
+    DAILY_GUARD_SCAN_TIME: str = "06:00"  # UTC HH:MM for scheduled morning run
+
     # Storage
     STORAGE_BACKEND: str = "local"  # 'local' or 's3'
     UPLOAD_DIR: str = "./uploads"

@@ -10,10 +10,11 @@ http_bearer = HTTPBearer(auto_error=True)
 
 
 class CurrentUserContext:
-    def __init__(self, user_id: str, organization_id: str, role: str):
+    def __init__(self, user_id: str, organization_id: str, role: str, business_role: Optional[str] = None):
         self.user_id = user_id
         self.organization_id = organization_id
         self.role = role
+        self.business_role = business_role
 
 
 async def get_current_user_context(
@@ -39,6 +40,7 @@ async def get_current_user_context(
     user_id: str = payload.get("sub")
     organization_id: str = payload.get("org_id")
     role: str = payload.get("role", "user")
+    business_role: Optional[str] = payload.get("business_role")
 
     if not user_id or not organization_id:
         raise HTTPException(
@@ -47,7 +49,12 @@ async def get_current_user_context(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return CurrentUserContext(user_id=user_id, organization_id=organization_id, role=role)
+    return CurrentUserContext(
+        user_id=user_id,
+        organization_id=organization_id,
+        role=role,
+        business_role=business_role,
+    )
 
 
 def require_admin(

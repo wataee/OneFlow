@@ -41,6 +41,7 @@ class AuthService:
             hashed_password=hashed,
             full_name=req.full_name,
             role=UserRole.ADMIN,
+            business_role=req.business_role,
         )
 
         # Audit initial registration
@@ -57,6 +58,7 @@ class AuthService:
             subject=user.id,
             organization_id=org.id,
             role=user.role.value,
+            business_role=user.business_role.value if user.business_role else None,
         )
         refresh_token = create_refresh_token(
             subject=user.id,
@@ -77,6 +79,7 @@ class AuthService:
             subject=user.id,
             organization_id=user.organization_id,
             role=user.role.value,
+            business_role=user.business_role.value if user.business_role else None,
         )
         refresh_token = create_refresh_token(
             subject=user.id,
@@ -119,6 +122,7 @@ class AuthService:
             subject=user.id,
             organization_id=user.organization_id,
             role=user.role.value,
+            business_role=user.business_role.value if user.business_role else None,
         )
         return new_access_token
 
